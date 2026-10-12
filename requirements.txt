@@ -1,0 +1,12 @@
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+feedparser>=6.0
+python-dotenv>=1.0
+beautifulsoup4>=4.12
+fastapi>=0.110
+uvicorn>=0.27
+pytest>=8.0
+# Optional ML (uncomment to enable LightGBM signal layer)
+# lightgbm>=4.0
+# scikit-learn>=1.4

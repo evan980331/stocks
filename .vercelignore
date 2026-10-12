@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+node_modules/
+.next/
+reports/
+tests/
+dashboard.log
+.git/
+.freebuff/
+
+twstock/data_store/*.db
+!twstock/data_store/twstock_v3.db
