@@ -11,13 +11,15 @@ import pandas as pd
 import pytest
 
 from twstock import signals as sig_mod
-from twstock.diagnostics import (HORIZONS, N_GROUPS, SIGNAL_KEYS, MIN_DAYS_FOR_IC,
-                                 SignalSpec, attach_forward_returns,
+from twstock.diagnostics import (HORIZONS, HORIZON_RATIONALE, N_GROUPS,
+                                 SIGNAL_KEYS, MIN_DAYS_FOR_IC, SignalSpec,
+                                 SpreadRobustness, attach_forward_returns,
                                  benjamini_hochberg, block_bootstrap_ci,
                                  build_signal_frame, decide_signal,
                                  forward_returns, ic_series, ic_summary,
                                  newey_west_tstat, per_stock_ic,
-                                 quantile_returns, random_ic_null)
+                                 quantile_returns, quantile_stability,
+                                 random_ic_null, spread_robustness)
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +283,94 @@ def test_quantile_reports_no_result_when_too_few_stocks():
 
 
 # --------------------------------------------------------------------------
+# 5b. 價差穩健性（是否只由少數交易日主導）
+# --------------------------------------------------------------------------
+def test_spread_robustness_flags_single_day_dominance():
+    sp = pd.Series([0.001, 0.001, 0.001, 0.001, 0.001, 0.30])
+    rb = spread_robustness(sp, top_k=1)
+    assert isinstance(rb, SpreadRobustness)
+    assert rb.n_days == 6
+    assert rb.top_k_share > 0.9              # 幾乎全部來自那一天
+    assert rb.trimmed_mean < rb.mean / 10    # 去極端值後大幅縮水
+    assert rb.positive_ratio == pytest.approx(1.0)
+
+
+def test_spread_robustness_trimmed_mean_recovers_true_level():
+    sp = pd.Series(np.concatenate([[9.0], np.full(100, 0.01), [-9.0]]))
+    rb = spread_robustness(sp)
+    assert rb.mean == pytest.approx(1.0 / 102)
+    assert rb.trimmed_mean == pytest.approx(0.01)     # 去極端值後回到真實水準
+    # 少數幾天不只貢獻全部，還被其他天抵銷 → 佔比可以超過 100%
+    assert rb.top_k_share > 1.0
+
+
+def test_spread_robustness_share_is_nan_when_total_is_negative():
+    rb = spread_robustness(pd.Series([-0.01] * 20 + [0.001]))
+    assert rb.mean < 0
+    assert math.isnan(rb.top_k_share)   # 負總和的「佔比」沒有意義，不可硬算
+
+
+def test_spread_robustness_handles_empty_and_tiny_input():
+    assert spread_robustness(pd.Series(dtype=float)).n_days == 0
+    rb = spread_robustness(pd.Series([0.01]))
+    assert rb.trimmed_mean == pytest.approx(0.01)
+    assert math.isnan(rb.top_k_share)   # 天數少於 top_k → 不臆測佔比
+    assert "無交易日" in SpreadRobustness().label()
+
+
+def test_quantile_result_carries_spread_robustness():
+    rows = [("2025-01-02", f"S{i:02d}", float(i), float(i) / 100)
+            for i in range(20)]
+    q = quantile_returns(_signal_frame(rows), "sig", 5)
+    assert q.robustness.n_days == 1
+    assert math.isfinite(q.robustness.mean)
+    assert q.robustness.mean == pytest.approx(q.spread)
+
+
+# --------------------------------------------------------------------------
+# 5c. 分期間一致性
+# --------------------------------------------------------------------------
+def test_quantile_stability_reports_each_segment():
+    from twstock.validation import Segment
+
+    dates = pd.bdate_range("2025-01-02", periods=60)
+    rows = []
+    for d in dates:
+        for i in range(20):
+            rows.append((d, f"S{i:02d}", float(i), float(i) / 100))
+    sf = _signal_frame(rows)
+    segs = (Segment("train", dates[0], dates[29], 30),
+            Segment("test", dates[30], dates[-1], 30))
+    out = quantile_stability(sf, "sig", 5, segs)
+    assert set(out) == {"train", "test"}
+    assert all(q.ordered for q in out.values())
+    assert all(q.n_days == 30 for q in out.values())
+
+
+def test_quantile_stability_returns_empty_result_for_empty_window():
+    from twstock.validation import Segment
+
+    dates = pd.bdate_range("2025-01-02", periods=30)
+    rows = [(d, f"S{i:02d}", float(i), float(i) / 100)
+            for d in dates for i in range(20)]
+    segs = (Segment("past", pd.Timestamp("1990-01-01"),
+                    pd.Timestamp("1990-12-31"), 0),)
+    out = quantile_stability(_signal_frame(rows), "sig", 5, segs)
+    assert out["past"].n_days == 0          # 明確降級，不臆造結果
+    assert "無交易日可檢驗" in out["past"].robustness.label()
+
+
+# --------------------------------------------------------------------------
+# 5d. 持有期間的選擇理由必須事先說明
+# --------------------------------------------------------------------------
+def test_horizon_rationale_is_documented_up_front():
+    assert "事先決定" in HORIZON_RATIONALE
+    assert "5 日" in HORIZON_RATIONALE
+    assert "1 日" in HORIZON_RATIONALE and "10 日" in HORIZON_RATIONALE
+    assert HORIZONS == (1, 5, 10)
+
+
+# --------------------------------------------------------------------------
 # 6. 隨機基準
 # --------------------------------------------------------------------------
 def _panel_with_signal(n_dates: int = 40, n_stocks: int = 20, seed: int = 1):
@@ -456,9 +546,14 @@ def test_run_diagnostics_end_to_end_on_synthetic_data(monkeypatch, tmp_path):
     assert len(rep.ic_all) == len(SIGNAL_KEYS) + 1      # 含合成 score
     text = rep.to_text()
     for section in ("[1] 研究對象與定義", "[2] IC 與 Rank IC", "[4] 分組測試",
-                    "[5] 隨機排序基準", "[8] 多重檢定校正", "[11] 結論限制"):
+                    "[5] 隨機排序基準", "[8] 多重檢定校正", "[11] 結論限制",
+                    "穩健性：價差是否只由少數交易日主導",
+                    "分期間一致性", "持有期間選擇理由"):
         assert section in text
     assert "不證明因果" in text
+    assert set(rep.segment_quantiles) == set(SIGNAL_KEYS) | {"score"}
+    assert all(set(v) == {"train", "valid", "test"}
+               for v in rep.segment_quantiles.values())
 
 
 def test_report_marks_no_conclusion_when_data_insufficient(monkeypatch):

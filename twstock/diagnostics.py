@@ -42,11 +42,18 @@ import pandas as pd
 from . import signals as sig_mod
 from .config import CONFIG, REPORTS_DIR
 from .costs import get_cost_model
-from .validation import TimeSplit, make_split
+from .validation import TimeSplit, make_split, subset_by_dates
 
 log = logging.getLogger(__name__)
 
 HORIZONS: tuple[int, ...] = (1, 5, 10)
+
+# 持有期間的選擇理由（**事先決定，未依結果調整**；任務要求事前說明）
+HORIZON_RATIONALE = (
+    "持有期間選擇理由（事先決定、未依結果調整）：1 日 = 最短可交易間隔，"
+    "檢驗訊號是否只有隔日效果；5 日 = 現行策略的實際持有期（CONFIG.hold_days），"
+    "與交易決策直接相關；10 日 = 現行持有期的兩倍，檢驗資訊是否在更長期間仍存在"
+    "或已反轉。刻意不測更多期間，以避免擴大多重檢定的假陽性風險。")
 N_GROUPS = 5                 # 五分組（任務允許 5 或 10；樣本僅 20 檔 → 用 5）
 MIN_DAYS_FOR_IC = 20         # 少於此交易日不宣稱 IC 有結論
 MIN_STOCKS_PER_DAY = 5       # 單日有效檔數下限
@@ -443,6 +450,56 @@ def per_stock_ic(signal_frame: pd.DataFrame, signal: str, horizon: int, *,
 # 分組測試
 # --------------------------------------------------------------------------
 @dataclass
+class SpreadRobustness:
+    """Q5-Q1 價差的穩健性：是否只由少數交易日主導。"""
+
+    n_days: int = 0
+    mean: float = float("nan")
+    trimmed_mean: float = float("nan")
+    top_k_share: float = float("nan")
+    positive_ratio: float = float("nan")
+
+    def label(self) -> str:
+        if self.n_days == 0:
+            return "無交易日可檢驗"
+        share = (f"{self.top_k_share:.1%}" if math.isfinite(self.top_k_share)
+                 else "N/A")
+        trim = (f"{self.trimmed_mean:+.3%}"
+                if math.isfinite(self.trimmed_mean) else "N/A")
+        return (f"{self.n_days} 日；去極端值後平均 {trim}；"
+                f"最佳 5 日佔價差總和 {share}；為正比例 {self.positive_ratio:.1%}")
+
+
+def spread_robustness(spread: pd.Series, *, top_k: int = 5,
+                      trim: float = 0.05) -> SpreadRobustness:
+    """檢驗 Q5-Q1 價差是否只由少數交易日主導。
+
+    - ``trimmed_mean``：去除最高與最低各 ``trim`` 比例的交易日後的平均價差；
+      若價差集中在少數幾天，去極端值後會大幅縮水。
+    - ``top_k_share``：最好的 ``top_k`` 個交易日佔價差總和的比例。
+      總和 <= 0 時回 NaN —— 總和為負時「佔比」沒有意義，不可硬算。
+    - ``positive_ratio``：價差為正的交易日比例。
+    """
+    x = np.asarray(pd.to_numeric(pd.Series(spread), errors="coerce").dropna(),
+                   dtype=float)
+    out = SpreadRobustness(n_days=int(len(x)))
+    if len(x) == 0:
+        return out
+    out.mean = float(x.mean())
+    out.positive_ratio = float((x > 0).mean())
+    k = int(max(1, round(len(x) * trim)))
+    if len(x) > 2 * k:
+        s = np.sort(x)
+        out.trimmed_mean = float(s[k:len(s) - k].mean())
+    else:
+        out.trimmed_mean = out.mean
+    total = float(x.sum())
+    if total > 0 and len(x) >= top_k:
+        out.top_k_share = float(np.sort(x)[-top_k:].sum() / total)
+    return out
+
+
+@dataclass
 class QuantileResult:
     signal: str
     horizon: int
@@ -456,6 +513,7 @@ class QuantileResult:
     cost_rate: float = float("nan")
     spread_net: float = float("nan")
     monotonicity: float = float("nan")     # 分組序與平均報酬的 Spearman
+    robustness: SpreadRobustness = field(default_factory=SpreadRobustness)
 
     @property
     def ordered(self) -> bool:
@@ -520,7 +578,23 @@ def quantile_returns(signal_frame: pd.DataFrame, signal: str, horizon: int, *,
     cm = cost_model or get_cost_model("typical")
     res.cost_rate = cm.roundtrip_cost_rate(100.0, 10_000)
     res.spread_net = res.spread - res.cost_rate
+    res.robustness = spread_robustness(sp)
     return res
+
+
+def quantile_stability(signal_frame: pd.DataFrame, signal: str, horizon: int,
+                       segments, *, n_groups: int = N_GROUPS,
+                       cost_model=None) -> dict[str, QuantileResult]:
+    """在各時間區段分別做分組測試，檢查**排序是否在不同時期維持**。
+
+    只看全期的單調性不夠：若排序只在某一段成立，就不是穩定的關係。
+    """
+    out: dict[str, QuantileResult] = {}
+    for seg in segments:
+        sub = subset_by_dates(signal_frame, seg.start, seg.end)
+        out[seg.name] = quantile_returns(sub, signal, horizon,
+                                         n_groups=n_groups, cost_model=cost_model)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -601,7 +675,9 @@ class DiagnosticsReport:
     ic_all: list[ICResult]
     ic_segments: list[ICResult]
     quantiles: list[QuantileResult]
-    randoms: list[RandomBaseline]
+    segment_quantiles: dict[str, dict[str, QuantileResult]] = field(
+        default_factory=dict)
+    randoms: list[RandomBaseline] = field(default_factory=list)
     per_stock: dict[str, pd.Series] = field(default_factory=dict)
     multiple_testing: dict = field(default_factory=dict)
     data_notes: list[str] = field(default_factory=list)
@@ -620,6 +696,9 @@ class DiagnosticsReport:
         L.append("    訊號於 T 日收盤可得 → T+1 開盤為第一個可成交價；"
                  "T→T+1 隔夜跳空不計入。")
         L.append(f"  持有期間：{', '.join(str(h) for h in self.horizons)} 個交易日")
+        L.append("  " + HORIZON_RATIONALE
+                 + ("" if set(HORIZONS) <= set(self.horizons) else
+                    f"（本次僅執行 {', '.join(str(h) for h in self.horizons)}）"))
         L.append("  統計單位：**每日橫斷面 IC**（非股票日）；"
                  "同日股票共享市場因子，不是獨立觀察值。")
         L.append("  顯著性：Newey-West 穩健 t（處理重疊窗口自相關）"
@@ -679,6 +758,36 @@ class DiagnosticsReport:
                      f"{q.cost_rate:>9.3%}{q.spread_net:>10.3%}"
                      f"{('是' if q.spread_net > 0 else '否'):>10}")
         L.append("")
+        L.append("  穩健性：價差是否只由少數交易日主導（去極端值 = 去除最高／最低各 5%）")
+        L.append(f"    {'訊號':<22}{'h':>3}{'毛價差':>10}{'去極端值':>11}"
+                 f"{'最佳5日佔比':>12}{'為正比例':>10}")
+        for q in self.quantiles:
+            spec = SIGNAL_BY_KEY.get(q.signal)
+            name = spec.cn_name if spec else q.signal
+            rb = q.robustness
+            L.append(f"    {name:<22}{q.horizon:>3}{q.spread:>10.3%}"
+                     f"{_fmt_pct(rb.trimmed_mean):>11}"
+                     f"{_fmt_pct(rb.top_k_share, signed=False):>12}"
+                     f"{_fmt_pct(rb.positive_ratio, signed=False):>10}")
+        L.append("    註：最佳 5 日佔價差總和接近 100% 表示價差幾乎全來自少數幾天；"
+                 "**超過 100% 表示少數幾天不只貢獻全部、還被其他天抵銷掉一部分**；"
+                 "價差總和為負時該欄為 N/A（負總和的佔比沒有意義）。")
+        L.append("")
+        L.append("  分期間一致性（h=5；各段獨立分組，檢查排序是否在不同時期維持）")
+        if self.segment_quantiles:
+            L.append(f"    {'訊號':<22}{'區段':>7}{'交易日':>7}{'Q5-Q1':>10}"
+                     f"{'單調':>6}{'扣成本後':>10}")
+            for key, segs in self.segment_quantiles.items():
+                spec = SIGNAL_BY_KEY.get(key)
+                name = spec.cn_name if spec else key
+                for seg_name, q in segs.items():
+                    L.append(f"    {name:<22}{seg_name:>7}{q.n_days:>7}"
+                             f"{_fmt_pct(q.spread):>10}"
+                             f"{('是' if q.ordered else '否'):>6}"
+                             f"{_fmt_pct(q.spread_net):>10}")
+        else:
+            L.append("    （資料量不足以切分區段）")
+        L.append("")
         L.append("[5] 隨機排序基準（同日內隨機置換，保留股票池與時間結構）")
         L.append(f"  {'訊號':<22}{'h':>3}{'觀察IC':>10}{'虛無均值':>10}"
                  f"{'虛無5%':>10}{'虛無95%':>10}{'經驗p值':>10}{'迭代':>7}")
@@ -730,6 +839,9 @@ class DiagnosticsReport:
         L.append("[9] 資料完整度與研究限制")
         for n in self.data_notes:
             L.append("  - " + n)
+        L.append("  - " + HORIZON_RATIONALE)
+        L.append("  - 價差穩健性與分期間一致性均以**事先決定**的準則呈現："
+                 "不因某個訊號在某段表現好就保留它。")
         L.append("")
         L.append("[10] 訊號判定（依本報告證據，非最終定論）")
         L.append(f"  {'訊號':<22}{'判定':<12}理由")
@@ -747,6 +859,13 @@ class DiagnosticsReport:
         L.append("  - 本報告**不挑選最佳參數**，也不宣稱任何策略具備獲利能力。")
         L.append("=" * 84)
         return "\n".join(L)
+
+
+def _fmt_pct(x: float, *, signed: bool = True, digits: int = 3) -> str:
+    """百分比格式化；無法計算時明確標示 N/A，不輸出 nan%。"""
+    if x is None or not math.isfinite(float(x)):
+        return "N/A"
+    return f"{float(x):+.{digits}%}" if signed else f"{float(x):.{digits}%}"
 
 
 def decide_signal(spec: SignalSpec, ic: ICResult, q: QuantileResult | None,
@@ -827,21 +946,31 @@ def run_diagnostics(*, horizons: tuple[int, ...] = HORIZONS,
 
     # ---- 樣本外分段 ----
     hold = 5
+    split = None
+    seg_ic: list[ICResult] = []
     try:
         split = make_split([pd.Timestamp(d) for d in dates],
                            train_frac=train_frac, valid_frac=valid_frac,
                            embargo_days=hold)
-        seg_ic: list[ICResult] = []
         for key in signals:
             for h in horizons:
                 ic = ic_series(sf, key, h)
                 for seg in (split.train, split.valid, split.test):
-                    sub = ic[(ic.index >= seg.start) & (ic.index <= seg.end)]
+                    sub = (ic if ic.empty
+                           else ic[(ic.index >= seg.start) & (ic.index <= seg.end)])
                     seg_ic.append(ic_summary(sub, key, h, segment=seg.name,
                                              sims=max(200, sims // 4)))
     except ValueError as e:
         log.warning("無法切分樣本外區段：%s", e)
+        split = None
         seg_ic = []
+
+    # ---- 分期間分組一致性（排序是否在不同時期維持） ----
+    seg_q: dict[str, dict[str, QuantileResult]] = {}
+    if split is not None:
+        segs = (split.train, split.valid, split.test)
+        for key in signals:
+            seg_q[key] = quantile_stability(sf, key, 5, segs, cost_model=cm)
 
     # ---- 個股層級 ----
     per_stock = {key: per_stock_ic(sf, key, 5) for key in signals}
@@ -865,6 +994,8 @@ def run_diagnostics(*, horizons: tuple[int, ...] = HORIZONS,
         f"股票池 {n_stocks} 檔、訊號列 {len(sf):,}；價格已套用除權息／分割還原。",
         "前瞻報酬以 T+1 開盤起算，與回測的成交假設（T+1 開盤進場）一致。",
         "缺值因子保持 NaN 並自相關計算中剔除，不以 0 冒充中性。",
+        "持有期間與顯著性方法均**事先決定**，未依結果調整；已測試的假設數量"
+        "與多重檢定校正均完整揭露。",
         f"多重檢定：同時檢定 {bh['n_tested']} 個（訊號 × 持有期間）假設，"
         f"未校正 {n_raw} 個看似顯著、BH 校正後 {bh['n_rejected']} 個。",
         "⚠️ 樣本僅約 2 年且屬單一多頭市況，IC 在此期間的表現不保證其他市況成立。",
@@ -879,8 +1010,8 @@ def run_diagnostics(*, horizons: tuple[int, ...] = HORIZONS,
         generated_at=dt.datetime.now().isoformat(timespec="seconds"),
         horizons=horizons, n_stocks=n_stocks, n_days=len(dates), period=period,
         ic_all=ic_all, ic_segments=seg_ic, quantiles=quantiles,
-        randoms=randoms, per_stock=per_stock, multiple_testing=mt,
-        data_notes=notes, decisions=decisions)
+        segment_quantiles=seg_q, randoms=randoms, per_stock=per_stock,
+        multiple_testing=mt, data_notes=notes, decisions=decisions)
 
 
 def _new_stats() -> dict:
