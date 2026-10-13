@@ -387,8 +387,15 @@ class ValidationReport:
                 excess = f"{p.excess():+.2%}" if self.strategy_benchmark_available else "N/A"
                 L.append(f"  {p.label:<26}{p.strategy_return:>10.2%}{bench:>10}"
                          f"{excess:>10}{p.n_trades:>6}")
-        else:
-            L.append("  （資料不足以分段）")
+            L.append(
+                "  註：每個子期間皆為「獨立起始」的單獨回測（各自重新投入初始資金、"
+                "無跨期間持倉）。")
+            L.append(
+                "      因此跨子期間界線、無法在該子期間內完成持有期的部位會被排除，"
+                "本表『筆數』會低於 [4] 的完整測試段筆數，")
+            L.append(
+                "      各列報酬也不可相加或複合回 [4] 的測試段總報酬；本表僅供各"
+                "子期間內與同期基準的方向性對照。")
         L.append("")
         L.append("[7] 資料完整度與測試限制")
         for n in self.data_notes:

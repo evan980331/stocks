@@ -201,3 +201,54 @@ def test_report_marks_benchmark_unavailable_without_fabricating():
     assert "基準不可用" in text
     assert "N/A" in text
     assert "0.00%" not in text.split("基準檢查")[1].split("[4]")[0]
+
+
+def test_market_period_subset_does_not_reuse_test_set():
+    """子期間表只能取測試段內的日期，不得含訓練或驗證期資料。"""
+    from twstock.strategies import baseline
+    from twstock.validation import (build_scores, market_periods,
+                                    subset_by_dates)
+    panel, prices = _synthetic_panel_and_prices(days=400)
+    scores = build_scores(panel)
+    dates = sorted(pd.to_datetime(scores["date"]).dt.normalize().unique())
+    split = make_split(dates, embargo_days=5)
+    periods = market_periods(scores, prices, split, baseline(), None, n_periods=4)
+    assert periods, "合成資料應足以切成 4 個子期間"
+    for p in periods:
+        lo, hi = [pd.Timestamp(x) for x in p.label.split("~")]
+        assert split.test.start <= lo <= hi <= split.test.end
+    # 子期間互不重疊且依時間排序
+    starts = [pd.Timestamp(p.label.split("~")[0]) for p in periods]
+    assert starts == sorted(starts)
+    assert len(set(starts)) == len(starts)
+
+
+def test_market_periods_are_standalone_and_do_not_compound():
+    """子期間各為獨立起始的單獨回測：跨界線部位被排除，故總筆數不超過完整
+    測試段筆數；各列報酬不可複合回測試段總報酬（報告已明文註記）。"""
+    from twstock.backtest import run_backtest
+    from twstock.strategies import baseline
+    from twstock.validation import (ValidationReport, build_scores,
+                                    check_benchmark, make_split,
+                                    market_periods, subset_by_dates,
+                                    subset_panel)
+    panel, prices = _synthetic_panel_and_prices(days=400)
+    scores = build_scores(panel)
+    dates = sorted(pd.to_datetime(scores["date"]).dt.normalize().unique())
+    split = make_split(dates, embargo_days=5)
+    spec = baseline()
+    seg = subset_by_dates(scores, split.test.start, split.test.end)
+    full = run_backtest(seg, subset_panel(prices, split.test.start, split.test.end),
+                        strategy=spec, benchmark=None)
+    periods = market_periods(scores, prices, split, spec, None, n_periods=4)
+    assert periods
+    assert sum(p.n_trades for p in periods) <= full.round_trips
+
+    # 報告必須說明此表不可複合，避免讀者誤加總
+    rep = ValidationReport(generated_at="now", split=split, folds=[],
+                           benchmark=check_benchmark(None), rows=[],
+                           strategy_benchmark_available=False, periods=periods)
+    text = rep.to_text()
+    section = text.split("[6]")[1].split("[7]")[0]
+    assert "不可相加" in section
+    assert "筆數" in section
