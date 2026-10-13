@@ -66,6 +66,11 @@ CREATE TABLE IF NOT EXISTS experts (
     score REAL, kind TEXT,
     PRIMARY KEY (source, link)
 );
+CREATE TABLE IF NOT EXISTS corporate_actions (
+    stock_id TEXT, date TEXT, kind TEXT,
+    factor REAL, price_scale INTEGER, detail TEXT,
+    PRIMARY KEY (stock_id, date, kind)
+);
 CREATE TABLE IF NOT EXISTS ingest_log (
     run_at TEXT, stock_id TEXT, dataset TEXT,
     ok INTEGER, rows INTEGER, error TEXT,
@@ -85,6 +90,7 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "news": ("stock_id", "link"),
     "signals": ("date", "stock_id"),
     "experts": ("source", "link"),
+    "corporate_actions": ("stock_id", "date", "kind"),
     "ingest_log": ("run_at", "stock_id", "dataset"),
     "meta": ("key",),
 }

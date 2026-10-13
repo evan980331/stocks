@@ -24,6 +24,9 @@ def isolated(temp_db, monkeypatch):
     monkeypatch.setattr(pipeline.fm, "fetch_institutional", lambda *a, **k: None)
     monkeypatch.setattr(pipeline.fm, "fetch_margin", lambda *a, **k: None)
     monkeypatch.setattr(pipeline.fm, "fetch_revenue", lambda *a, **k: None)
+    # 單元測試不得連外：公司行動（分割／股利）一律以假函式取代
+    monkeypatch.setattr(pipeline.fm, "fetch_splits", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.fm, "fetch_dividends", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "CONFIG",
                         type("C", (), {"pool": {"2330": "台積電", "2317": "鴻海"},
                                        "benchmark": "0050",

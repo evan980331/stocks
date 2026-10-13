@@ -16,7 +16,8 @@ import pandas as pd
 from . import features as feat_mod
 from .config import CONFIG, REPORTS_DIR
 from .data import finmind_client as fm
-from .data import store
+from .data import loader, store
+from .data.quality import build_corporate_actions, clean_prices
 from .sentiment import sentiment as sent
 
 log = logging.getLogger(__name__)
@@ -26,13 +27,50 @@ PRICE_DATASET = "price"
 
 
 def _write_price(df: pd.DataFrame | None, sid: str) -> tuple[bool, int, str]:
+    """寫入價量；無效價格列（<=0 或缺失）一律剔除，成為缺口而非 0。"""
     if df is None:
         return False, 0, "fetch_failed"
     if df.empty:
         return True, 0, "empty"
     out = df.drop(columns=["spread", "turnover"], errors="ignore")
+    out, dropped = clean_prices(out)
+    if not dropped.empty:
+        log.warning("  %s 剔除 %d 列無效價格（%s）", sid, len(dropped),
+                    ", ".join(str(pd.Timestamp(d).date())
+                              for d in dropped["date"].head(3)))
     n = store.write_df(out, "price", key_cols=("stock_id", "date"))
-    return True, n, ""
+    err = f"dropped_invalid:{len(dropped)}" if not dropped.empty else ""
+    return True, n, err
+
+
+def _ingest_corporate_actions(sid: str, start: str, end: str,
+                              run_at: str) -> int:
+    """抓取分割與股利事件，計算還原調整因子並入庫。"""
+    splits = fm.fetch_splits(sid, start, end)
+    divs = fm.fetch_dividends(sid, start, end)
+    if splits is None and divs is None:
+        store.log_ingest(run_at, sid, "corporate_actions", ok=False,
+                         error="fetch_failed")
+        return 0
+    price = store.read_sql(
+        "SELECT date, close FROM price WHERE stock_id=? ORDER BY date", (sid,))
+    actions, warns = build_corporate_actions(price, sid, splits, divs)
+    for w in warns:
+        log.warning("  %s", w)
+    # 以本輪結果整批取代該檔的公司行動，避免已被驗證為無效的舊事件殘留
+    store.exec_sql("DELETE FROM corporate_actions WHERE stock_id=?", (sid,))
+    if not actions:
+        store.log_ingest(run_at, sid, "corporate_actions", ok=True, rows=0)
+        return 0
+    df = pd.DataFrame([{
+        "stock_id": a.stock_id, "date": str(a.date), "kind": a.kind,
+        "factor": a.factor, "price_scale": int(a.price_scale), "detail": a.detail,
+    } for a in actions])
+    n = store.write_df(df, "corporate_actions",
+                       key_cols=("stock_id", "date", "kind"))
+    store.log_ingest(run_at, sid, "corporate_actions", ok=True, rows=n)
+    log.info("  %s 公司行動 %d 筆（還原因子已更新）", sid, n)
+    return n
 
 
 def ingest(stocks: list[str] | None = None) -> dict[str, int]:
@@ -82,10 +120,12 @@ def ingest(stocks: list[str] | None = None) -> dict[str, int]:
         n_inst = _save(fm.fetch_institutional(sid, start, end), "institution", sid, "institution")
         n_mg = _save(fm.fetch_margin(sid, start, end), "margin", sid, "margin")
         n_rev = _save(fm.fetch_revenue(sid, "2015-01-01", end), "revenue", sid, "revenue")
+        # 公司行動必須在價量寫入後計算（需要除息前收盤價）
+        n_ca = _ingest_corporate_actions(sid, start, end, run_at)
         n_news = sent.update_news_for(sid, CONFIG.pool.get(sid, ""), days=7)
         store.log_ingest(run_at, sid, "news", ok=True, rows=n_news)
-        log.info("  price=%s inst=%s margin=%s revenue=%s news=%s",
-                 n_price, n_inst, n_mg, n_rev, n_news)
+        log.info("  price=%s inst=%s margin=%s revenue=%s corp=%s news=%s",
+                 n_price, n_inst, n_mg, n_rev, n_ca, n_news)
         counts[sid] = n_price
         fm.polite_sleep(0.8)
 
@@ -105,16 +145,23 @@ def ingest(stocks: list[str] | None = None) -> dict[str, int]:
     return counts
 
 
-def load_benchmark() -> pd.DataFrame:
-    """讀取基準（0050）日K；不存在時回空表。"""
-    return store.read_sql(
-        "SELECT date, close FROM price WHERE stock_id=? ORDER BY date",
-        (CONFIG.benchmark,))
+def load_benchmark(adjusted: bool = True) -> pd.DataFrame:
+    """讀取基準（0050）日K；不存在時回空表。
+
+    預設回傳**已還原**序列——未還原的 0050 在 1 拆 4 當日會顯示 -75% 的假崩盤，
+    使基準報酬嚴重錯誤（實測曾因此產生 +67% 的假超額報酬）。
+    """
+    price = loader.load_price_panel(adjusted=adjusted,
+                                   columns="date, stock_id, close")
+    return loader.benchmark_series(price, CONFIG.benchmark)
 
 
-def load_panel() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """組合價量 + 籌碼 + 新聞日分數 → features 面板。回傳 (panel, news)。"""
-    price = store.read_sql("SELECT * FROM price")
+def load_panel(stats: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """組合價量 + 籌碼 + 新聞日分數 → features 面板。回傳 (panel, news)。
+
+    價格使用**已還原**序列，避免除權息缺口被當成真實下跌。
+    """
+    price = loader.load_price_panel(adjusted=True, stats=stats)
     inst = store.read_sql("SELECT * FROM institution")
     margin = store.read_sql("SELECT * FROM margin")
     rev = store.read_sql("SELECT * FROM revenue")
@@ -202,7 +249,7 @@ def run_backtest_cli() -> str:
     scores = store.read_sql("SELECT * FROM signals")
     if scores.empty:
         return "無訊號可回測，請先 run"
-    price = store.read_sql("SELECT * FROM price")
+    price = loader.load_price_panel(adjusted=True)
     panel = {sid: g for sid, g in price.groupby("stock_id")}
     benchmark = panel.get(CONFIG.benchmark)
 
@@ -218,7 +265,8 @@ def run_backtest_cli() -> str:
         f" ~ {result.equity.index[-1] if len(result.equity) else '-'}\n"
         f"假設：T+1 開盤進場 / 到期日開盤出場 / 手續費 {CONFIG.commission_effective:.4%}"
         f"（低消 {CONFIG.buy_fixed_fee:.0f}）/ 證交稅 {CONFIG.tax_rate:.2%} / 滑價 {CONFIG.slippage:.2%}\n"
-        f"單檔部位上限 {CONFIG.max_position_pct:.0%} / 漲跌停 {CONFIG.limit_pct:.0%}\n\n")
+        f"單檔部位上限 {CONFIG.max_position_pct:.0%} / 漲跌停 {CONFIG.limit_pct:.0%}\n"
+        f"價格：已套用除權息／分割還原；策略與基準採一致處理\n\n")
     out.write_text(header + report + "\n\n" + str(result.trades.head(80)), encoding="utf-8")
     return report + f"\n（詳細報告：{out}）"
 

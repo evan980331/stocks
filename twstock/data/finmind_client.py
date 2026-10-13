@@ -84,6 +84,20 @@ def fetch_benchmark(start: str, end: str) -> pd.DataFrame | None:
     return fetch_price(CONFIG.benchmark, start, end)
 
 
+def fetch_splits(stock_id: str, start: str, end: str) -> pd.DataFrame | None:
+    """分割／減資事件（FinMind TaiwanStockSplitPrice，免費層可用）。"""
+    return fetch_finmind("TaiwanStockSplitPrice", stock_id, start, end)
+
+
+def fetch_dividends(stock_id: str, start: str, end: str) -> pd.DataFrame | None:
+    """股利政策（FinMind TaiwanStockDividend，免費層可用）。
+
+    含 CashEarningsDistribution／CashExDividendTradingDate 等欄位，
+    用於計算除息日的還原調整因子。
+    """
+    return fetch_finmind("TaiwanStockDividend", stock_id, start, end)
+
+
 def polite_sleep(seconds: float = 0.6) -> None:
     time.sleep(seconds)
 

@@ -128,6 +128,12 @@ def build_features(price: pd.DataFrame,
     df = price.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
+    # 非正數價格視為缺值（缺值不可填 0，否則 pct_change 會變成 ±inf）
+    for col in ("open", "high", "low", "close"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.loc[df[col] <= 0, col] = np.nan
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
 
     close = df["close"]
     for w in momentum_windows:
