@@ -44,6 +44,31 @@ python -m twstock.validation --quick      :: 只比較基準策略，較快
 資料完整度與測試限制，以及**週轉率與成本假設定義**。
 輸出於 `twstock/reports/validation_*.txt`。
 
+### 訊號資訊量診斷（訊號有沒有資訊？）
+
+```bat
+python -m twstock.diagnostics            :: 全部持有期間
+python -m twstock.diagnostics --quick    :: 只跑 5 日、較少模擬次數
+```
+
+對 12 個底層因子逐一計算 IC / Rank IC（1/5/10 日前瞻報酬）、五分組報酬、
+隨機排序基準、Newey-West 穩健 t、區塊自助法信賴區間與 Benjamini-Hochberg
+多重檢定校正，並依證據判定每個訊號是「初步獲支持 / 未獲支持 / 樣本不足」。
+前瞻報酬一律由 **T+1 開盤**起算（與回測成交假設一致）。
+輸出於 `twstock/reports/diagnostics_*.txt`。
+
+### 策略失效歸因（為什麼沒轉化成超額報酬？）
+
+```bat
+python -m twstock.attribution            :: 測試段；預設 200 次隨機控制
+python -m twstock.attribution --sims 500
+```
+
+三個控制變因（真實訊號 / **隨機選股** / **完美前瞻上限（不可交易）**）
+只改變分數，交易規則、成本與資金限制完全相同；另拆解訊號→持倉落差、
+進場延遲、週轉來源、曝險、集中度與成本。
+輸出於 `twstock/reports/attribution_*.txt`。
+
 ### 服務生命週期
 
 ```bat
@@ -145,3 +170,7 @@ ML 標籤、訊號融合尺度、回測時間正確性、風險限制與 Kill Sw
 
 - [`plan.md`](plan.md)：工程計畫、進度、已知問題與下一步。
 - [`docs/STATUS_REPORT.md`](docs/STATUS_REPORT.md)：專案現況盤點與缺陷證據。
+- [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md)：歷史資料偏差改善方案、
+  survivorship bias 的量化限制與資料來源比較（含授權與價格查證）。
+- [`docs/WORKER_SUBPROCESS.md`](docs/WORKER_SUBPROCESS.md)：Worker 子程序架構評估、
+  停止階梯與失敗情境測試（尚未全面遷移）。
