@@ -141,6 +141,19 @@ Windows 一鍵包裝：`run.bat`。安全停止會寫入 `data_store/state/*.sto
 累積報酬、CAGR、Sharpe、Sortino、MDD、勝率、平均獲利/虧損、獲利因子、
 交易次數、週轉率、成本佔比、曝險比例、基準比較、樣本外表現、參數敏感度。
 
+**週轉率定義**（`backtest.py` docstring 與報告 [8] 節）：
+令 `notional_traded = 買進名目 + 賣出名目`（買賣各計一次）：
+`turnover = notional_traded / initial_capital`（累積、未年化），
+`turnover_one_way = turnover / 2`，`turnover_annualized = turnover / 年數`，
+`portfolio_turnover_annualized = (notional/2) / 平均權益 / 年數`。
+**週轉率不等於交易次數**（後者另列）。
+
+### 5.6 除權息／分割還原（策略與基準一致）
+
+價格一律經 `data/loader.load_price_panel(adjusted=True)`：
+非正數價格→缺值；以 FinMind 分割／股利事件建立調整因子，對事件日之前價格後調。
+若事件與價格序列不符（套用後反而增加不連續）則**捨棄並記錄**，保守處理。
+
 > 即使通過回測也不代表未來獲利。不得只呈現最佳結果。
 
 ---
@@ -190,8 +203,8 @@ Kill Switch 只「禁止新增正式委託」，**不刪除交易紀錄、不自
 |---|---|---|---|
 | **P0** | 現況盤點（程式/資料/模型/回測/Git） | 產出 `docs/STATUS_REPORT.md` 並標明證據 | `VERIFIED` |
 | **P1** | 資料品質與基礎架構（覆蓋、時間戳、重跑、錯誤處理） | 新聞不再互相覆蓋、ingest 失敗不得記為成功、寫入可重跑 | `DONE`（見 §8） |
-| **P2** | 策略與回測可信度 | 無 look-ahead、成本模型合理、有基準比較、可重現 | `DONE`（樣本外待補） |
-| **P3** | 本地監控 Worker | 可持續執行、可觀測、可重啟恢復 | `IN_PROGRESS` |
+| **P2** | 策略與回測可信度 | 無 look-ahead、成本模型合理、有基準比較、可重現 | `VERIFIED`（P2.1 樣本外 + P2.2 成本已驗證） |
+| **P3** | 本地監控 Worker | 可持續執行、可觀測、可重啟恢復 | `VERIFIED`（P3.1 硬化完成） |
 | **P4** | 風險控制與模擬券商 | 風控、委託狀態機、持倉同步、冪等、Kill Switch | `TODO` |
 | **P5** | 模擬交易與故障測試 | 完整生命週期 + 失敗情境測試 | `TODO` |
 | **P6** | 正式券商 API 整合準備 | 券商評估、介面、憑證安全（live 仍關閉） | `BLOCKED`（需使用者選券商） |
@@ -266,6 +279,65 @@ Kill Switch 只「禁止新增正式委託」，**不刪除交易紀錄、不自
 
 ---
 
+### W11 — 公司行動未還原（除權息／分割）✅ `VERIFIED`
+- **問題**：價格表為 FinMind 原始收盤價，**完全未還原公司行動**。實測 0050 於
+  2025-06-18 因 1 拆 4 出現 **−74.8%** 的假崩盤；以該序列算出的基準報酬為
+  **−69.94%**（實際為 +22.76%），連帶讓「超額報酬」出現 +67% 的假優勢。
+  另有 2603 除息缺口 −13.8%、−12.0% 超過漲跌停幅度。
+- **修復**：新增 `twstock/data/quality.py` 與 `loader.py`：
+  以 FinMind `TaiwanStockSplitPrice`／`TaiwanStockDividend` 建立調整因子
+  （分割 `after/before`、現金股利 `(前收−股利)/前收`、股票股利 `1/(1+配股)`），
+  對事件日之前價格做乘法後調；策略與基準**採一致處理**。
+- **驗證守門**：只在「能真正降低序列不連續」時才套用因子；與價格序列不符的事件
+  一律捨棄並記錄（實測富邦金的股票股利事件屬此類，避免製造 +20.8% 假跳動）。
+- **驗證**：`tests/test_data_quality.py` 16 項；0050 分割日報酬由 −74.8% 修正為 +0.9%。
+
+### W12 — 無效價格列（0 元）污染回測 ✅ `VERIFIED`
+- **問題**：2317（鴻海）2025-07-30 之 open/high/low/close/volume **全為 0**。
+  舊版以 0 為價格，會使市值瞬間歸零、產生假回撤與 ±inf 報酬。
+- **修復**：`clean_prices()` 在寫入與讀取兩端將非正數價格視為**缺值**（不是 0）；
+  `backtest._prepare` 與 `features.build_features` 同步防護。
+- **驗證**：`tests/test_costs_turnover.py::test_zero_price_row_does_not_corrupt_equity`。
+
+### W13 — P2.1 樣本外驗證流程 ✅ `VERIFIED`
+- 新增 `twstock/validation.py`：時間序列切分（**不洗牌**）、purge/embargo
+  （移除標籤期間跨界的樣本）、可記錄窗口的 walk-forward、只以訓練資料擬合的
+  `FeatureScaler`、基準缺失明確回報、`HoldoutGuard` 防止重複使用測試集。
+- 報告含：切分期間、樣本/交易數、報酬、MDD、Sharpe、勝率與盈虧比、
+  成本前後績效、基準比較、不同市場期間、資料完整度與限制，
+  以及**週轉率與成本假設定義**（可稽核）。
+- **驗證**：`tests/test_validation.py`；`python -m twstock.validation` 產出完整報告。
+
+### W14 — P2.2 成本模型與週轉率定義 ✅ `VERIFIED`
+- 新增 `twstock/costs.py`：`CostModel` + 6 組成本情境（zero/ideal/typical/
+  conservative/adverse/severe），含可設定的手續費折扣、低消、證交稅、滑價，
+  以及 `participation_rate` 成交量上限。
+- **週轉率定義釐清**：舊回報的 94.72x 實為 `(買進名目+賣出名目)/初始資金`，
+  **未年化且買賣各計一次**；已改為四項指標（累積雙邊／累積單邊／年化雙邊／
+  年化單邊資金），並在回測 docstring 與報告 [8] 節寫明。
+- **驗證**：`tests/test_costs_turnover.py`（公式、稅僅賣出、低消、流動性上限、
+  成本單調性）。
+
+### W15 — 降低換手的策略變體 ✅ `VERIFIED`
+- 新增 `twstock/strategies.py`：`StrategySpec` 支援 `rebalance_days`（再平衡頻率）、
+  `buy_threshold`（進場門檻）、`exit_threshold` + `min_hold_days`（訊號緩衝區 +
+  最短持有）、`hold_days`（最長持有）。
+- 回測新增 `hysteresis` 持倉政策：出場決策只用「當日之前最近一個交易日的分數」，
+  仍於當日開盤成交，維持時間正確性。
+- **驗證**：`tests/test_costs_turnover.py`（提前出場、最短持有、再平衡降低交易數）。
+
+### W16 — P3.1 Worker 硬化 ✅ `VERIFIED`
+- 新增單一實例鎖（PID 檔、死鎖自動回收）、有上限的指數退避重試、
+  任務逾時偵測（`task_started_at` 殘留 → 判定上次被中斷）、
+  以及 9 種健康狀態機 `derive_state()`。
+- **停止語意修正**：原 `ops.stop()` 只要 PID 消失就回報「已安全停止」，
+  但實際可能是被訊號直接殺掉（未收尾）。改為：worker 先寫停止旗標等它自行收尾，
+  只有逾時才送訊號／強制終止，並**區分回報「已安全停止」與「已強制停止」**；
+  行程結束後清理 PID 檔、停止旗標與殘留鎖。
+- **驗證**：`tests/test_worker_hardening.py`、`tests/test_ops_lifecycle.py`；
+  實機 `start worker` → 狀態「任務執行中／正常運作」→ `stop worker` **1.77 秒**內
+  自行收尾，心跳 status=`stopped`、鎖與旗標皆已清除。
+
 ## 9. 測試方式及驗證結果
 
 ```bat
@@ -283,6 +355,11 @@ python -m pytest -q
 | `tests/test_ml_labels.py` | 標籤基準與缺失處理（W5） |
 | `tests/test_fusion.py` | 融合尺度（W6） |
 | `tests/test_backtest_timing.py` | 無 look-ahead（W7） |
+| `tests/test_data_quality.py` | 無效價格、除權息／分割還原與驗證守門（W11/W12） |
+| `tests/test_validation.py` | 切分、purge/embargo、轉換不洩漏、基準處理（W13） |
+| `tests/test_costs_turnover.py` | 成本模型、週轉率公式、成本單調性、換手變體（W14/W15） |
+| `tests/test_worker_hardening.py` | 鎖、重試、逾時、健康狀態、生命週期（W16） |
+| `tests/test_ops_lifecycle.py` | 停止語意與狀態清理（W16） |
 
 **現況**：P0 基準 `14 passed` → 首輪修復後 **`55 passed`**（新增 41 項回歸測試）。
 
@@ -306,6 +383,10 @@ python -m pytest -q
 | B1 | **LightGBM / scikit-learn 未安裝** → ML 層完全未啟用，融合的 ML 分支無法驗證 | 高 | `BLOCKED`（需使用者決定是否安裝） |
 | B2 | 未選定台灣券商 → 交易執行層無法實作，P6–P7 阻塞 | 高 | `BLOCKED`（需使用者決策） |
 | B3 | 行情為**延遲/收盤後**資料，非即時；盤中監控能力受限 | 中 | `TODO`（需即時行情授權） |
+| B11 | 樣本僅約 1.93 年且屬單一市況（多頭），未涵蓋空頭 | 高 | `TODO`（需更長歷史） |
+| B12 | 策略在所有區段皆**未勝過買進持有 0050**（超額 −8% ~ −30%） | 高 | 已實測並記錄；不宣稱具獲利能力 |
+| B13 | 部分公司行動因與價格序列不符而被捨棄（保守、略低估報酬） | 低 | `DONE`（有記錄） |
+| B14 | `TaiwanStockPriceAdj` 為 FinMind 付費層，故自行還原 | 低 | `DONE`（改用事件檔） |
 | B4 | 股票池為寫死的 20 檔，未處理下市/新上市/成分變動 → survivorship 風險 | 中 | `TODO` |
 | B5 | 月營收點時（point-in-time）僅以 `date` 近似，未用公告時間 | 中 | `TODO` |
 | B6 | 無 Worker 持續排程與崩潰恢復的完整實作 | 中 | `IN_PROGRESS`（P3） |
@@ -338,11 +419,13 @@ python -m pytest -q
 
 ## 13. 下一個最優先執行的任務
 
-1. **P3 監控 Worker 硬化**：排程、健康檢查、崩潰恢復、增量計算（`IN_PROGRESS`）。
-2. **P2 後半**：樣本外（train/valid/test）切分與參數敏感度報告。
-3. **P4**：`risk.py` 風控模組 + `broker/sim.py` 模擬券商 + 委託狀態機 + Kill Switch。
+1. **P4**：模擬券商 + 委託狀態機 + 持倉同步 + 冪等控制（`risk.py` 已有檢查層）。
+2. **B11/B12 回應**：延長歷史與納入空頭期間；先解釋「為何輸給買進持有」
+   （多頭樣本 + 每日再平衡的高換手成本），再決定是否繼續發展策略。
+3. **B4 硬化**：以 FinMind 全市場清單 + 下市清單處理 survivorship bias。
 4. **B1 決策**：是否安裝 `lightgbm`/`scikit-learn` 以啟用並驗證 ML 層（需使用者決定）。
-5. **B4 硬化**：以 FinMind 全市場清單 + 下市清單處理 survivorship bias。
+5. **參數敏感度**：對 hold_days / rebalance_days 做網格分析並以 walk-forward 驗證，
+   但**不得**以同一測試集挑選參數。
 
 ---
 
@@ -356,14 +439,20 @@ python -m pytest -q
 
 每個 commit 皆為可獨立驗證的工作單位（以 `pytest` 確認）。
 
-## 最後驗證
+## 最後驗證（P2.1 / P2.2 / P3.1，2026-10-13）
 
-- 驗證時間：2026-10-13
-- `python -m pytest -q` → **55 passed**
-- `python -m compileall -q twstock tests` → OK
-- `python -m twstock.cli run` → 9700 筆訊號寫入（規則分數；ML 因未安裝 lightgbm 而停用）
-- `python -m twstock.cli backtest` → 年化 +11.07% / 總報酬 +23.27% / Sharpe 0.71 /
-  Sortino 0.96 / MDD -18.18% / 勝率 47.93% / 459 筆 / 週轉率 94.72x
-  （修正 look-ahead 前為 +96.38%，證實高估來源）
+- `python -m pytest -q` → **140 passed**（正式退出碼 0）
+- `python -m twstock.validation` → 產出完整報告
+  （`twstock/reports/validation_*.txt`；摘要見 `docs/STATUS_REPORT.md`）
+- Worker 實機：`start worker` → 健康狀態「任務執行中」→「正常運作」
+  （`run_cycle 成功（嘗試 1 次，126.4s）`，ingest 20/20 成功、9719 筆訊號）
+  → `stop worker` **1.77 秒**自行收尾，心跳 `stopped`、鎖與停止旗標已清除
+- 資料還原實測：0050 分割日報酬 −74.8% → +0.9%；2317 無效列已剔除；
+  公司行動共 41 筆套用
+
+### 前一輪驗證（P0/P1/P2 基礎，2026-10-13）
+
+- `python -m pytest -q` → 55 passed；`compileall` OK
+- `python -m twstock.cli backtest` → 修正 look-ahead 後年化由 +96.38% 降為 +11.07%
 - 儀表板：`start dashboard` → `GET /` 200、`GET /api/health` 200 → `stop` 後連線關閉
-- **未驗證項**：ML 端到端（lightgbm 未安裝）、0050 基準實際抓取（需網路）、Worker 實跑一輪
+- **仍未驗證**：ML 端到端（lightgbm 未安裝）
