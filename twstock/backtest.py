@@ -285,6 +285,8 @@ def run_backtest(scores: pd.DataFrame,
             notional_traded += notional
             trades.append({
                 "entry_date": pos["entry_date"], "exit_date": day,
+                # 訊號日（供歸因量測訊號→成交的延遲），不影響任何計算
+                "signal_date": pos.get("signal_date"),
                 "stock_id": sid, "qty": pos["qty"],
                 "entry_price": pos["entry_price"], "exit_price": px,
                 "holding_days": days_held,
@@ -349,6 +351,7 @@ def run_backtest(scores: pd.DataFrame,
                     "entry_price": px, "qty": qty, "cost": cost,
                     "entry_cost": buy_cost,
                     "entry_date": day, "exit_date": cand["exit_date"],
+                    "signal_date": cand["signal_date"],
                     "entry_i": i,
                 }
 
