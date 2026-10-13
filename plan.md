@@ -491,26 +491,32 @@ python -m pytest -q
 
 ## 本輪 commit（P2.3 / P2.4 / P2.5 / P3.2，2026-10-14，已 push 至 `origin/main`）
 
-起始 HEAD = `3ae68ee`；結束 HEAD = `origin/main` = `6df3e4b`。無 force push。
+起始 HEAD = `3ae68ee`；結束 HEAD = `origin/main` = `2791fd0`。無 force push。
 
 | 順序 | SHA | 訊息 | 內容 |
 |---|---|---|---|
 | 1 | `96261a9` | `feat(quant): 新增訊號資訊量診斷（IC、分組、隨機基準、多重檢定）` | signals.py（抽出 `_factor_parts`）、diagnostics.py、`test_diagnostics.py`（36） |
 | 2 | `f6e72dc` | `feat(quant): 策略失效歸因，以隨機選股與完美前瞻拆解瓶頸` | backtest.py（交易新增 `signal_date`）、attribution.py、`test_attribution.py`（22） |
 | 3 | `63888e7` | `feat(worker): 耗時任務子程序隔離原型，修正 CTRL_BREAK 造成的假優雅停止` | jobs.py、`test_jobs.py`（23） |
-| 4 | `6df3e4b` | `docs: 記錄 P2.3/P2.4/P2.5/P3.2 結果、資料來源方案與子程序架構` | README、plan.md、STATUS_REPORT、DATA_SOURCES、WORKER_SUBPROCESS（+ 本表） |
+| 4 | `6df3e4b` | `docs: 記錄 P2.3/P2.4/P2.5/P3.2 結果、資料來源方案與子程序架構` | README、plan.md、STATUS_REPORT、DATA_SOURCES、WORKER_SUBPROCESS |
+| 5 | `f8ac339` | `docs(plan): 補上本輪 commit 表與最終驗證紀錄` | plan.md |
+| 6 | `2791fd0` | `feat(quant): 補齊分組穩健性、分期間一致性與持有期間選擇理由` | diagnostics.py、`test_diagnostics.py`、STATUS_REPORT（+ 本表） |
 
 每個 commit 皆為可獨立驗證的工作單位：`signals.py` 的重構在不改行為下
 （既有 9 項測試不變即通過）完成；`backtest.py` 只新增欄位、不動計算。
 
 ## 最後驗證（P2.3 / P2.4 / P2.5 / P3.2，2026-10-14）
 
-- `python -m pytest -q` → **226 passed**（正式退出碼 0；起始為 145，本階段 +81）
+- `python -m pytest -q` → **234 passed**（正式退出碼 0；起始為 145，本階段 +89）
 - `python -m twstock.diagnostics` → 退出碼 0，報告
-  `twstock/reports/diagnostics_20261014_005706.txt`（486 交易日、12 因子 × 3 持有期間）
+  `twstock/reports/diagnostics_20261014_020427.txt`（486 交易日、12 因子 × 3 持有期間，
+  含價差穩健性與分期間一致性）
 - `python -m twstock.attribution --sims 200` → 退出碼 0，報告
   `twstock/reports/attribution_20261014_010205.txt`（測試段 122 交易日、200 次隨機控制）
-- 工作目錄乾淨（`git status` 無輸出）；`HEAD = origin/main = 6df3e4b`
+- 工作目錄乾淨（`git status` 無輸出）；`HEAD = origin/main = 2791fd0`
+- 複核任務要求時發現三項未完整涵蓋的檢查並已補齊（持有期間選擇理由、
+  分組排序的跨時期一致性、價差是否只由少數交易日主導），各自有測試與報告段落；
+  結果強化了原結論：**沒有任何訊號在三個區段都維持單調排序**。
 
 ### 前兩輪 commit
 
