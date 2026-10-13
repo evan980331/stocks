@@ -2,9 +2,14 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
+
+# 本地資料與產出（SQLite DB、PID、日誌、回測報告）
 data_store/
 reports/
+*.log
+
+.pytest_cache/
 node_modules/
 .next/
-
-.vercel
