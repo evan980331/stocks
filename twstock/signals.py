@@ -13,6 +13,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from .config import CONFIG
+
 log = logging.getLogger(__name__)
 
 # 因子權重（總和 = 1.0，打分時會再依可用因子標準化）
@@ -197,6 +199,72 @@ def score_stocks(features_by_stock: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 # 建議動作的中英對照（DB 存英文代碼，顯示時轉中文）
 ACTION_CN = {"BUY": "買進", "HOLD": "持有", "AVOID": "迴避"}
+
+
+def _rank_pct(s: pd.Series) -> pd.Series:
+    """當日橫斷面排名百分位，映射到 [-1, 1]（尺度無關）。
+
+    只有一檔股票時無法比較，回傳 0（中性），不臆測方向。
+    """
+    v = pd.to_numeric(s, errors="coerce")
+    n = int(v.notna().sum())
+    if n <= 1:
+        return pd.Series(0.0, index=s.index)
+    r = v.rank(method="average")
+    return (r - 1) / (n - 1) * 2 - 1
+
+
+def fuse_scores(rule: pd.DataFrame, ml: pd.DataFrame | None = None,
+                *, weight_rule: float | None = None,
+                weight_ml: float | None = None) -> pd.DataFrame:
+    """融合規則分數與 ML 預測分數。
+
+    問題背景：規則分數定義於 [-1, 1]，而 ML 輸出是「預測未來 N 日超額報酬率」
+    （量級約 ±0.03）。兩者尺度不同，直接加權相加會讓 ML 形同被忽略、
+    且缺值填 0 會冒充「中性」。
+
+    作法：先把每個訊號做**當日橫斷面排名百分位**映射到 [-1, 1]，再加權平均。
+    排名化的好處是尺度不變、對離群值穩健，適合跨模型融合。
+
+    - 沒有 ML 資料（或全缺）時，明確退化為規則分數，不假裝有 ML 訊號。
+    - 回傳欄位：date, stock_id, score, rule_score, ml_score, reason, close
+    """
+    w_r = CONFIG.fusion_weight_rule if weight_rule is None else weight_rule
+    w_m = CONFIG.fusion_weight_ml if weight_ml is None else weight_ml
+
+    out = rule.copy()
+    out["rule_score"] = pd.to_numeric(out["score"], errors="coerce")
+    out["ml_score"] = np.nan
+
+    has_ml = ml is not None and not ml.empty and "ml_score" in ml.columns
+    if not has_ml:
+        out["score"] = out["rule_score"]
+        return out.drop(columns=["rule_score"])
+
+    keys = ["date", "stock_id"]
+    merged = out.merge(ml[keys + ["ml_score"]], on=keys, how="left",
+                       suffixes=("", "_ml"))
+    # 若來源本身已帶 ml_score 欄位，避免重複
+    if "ml_score_ml" in merged.columns:
+        merged["ml_score"] = merged["ml_score_ml"].combine_first(merged["ml_score"])
+        merged = merged.drop(columns=["ml_score_ml"])
+
+    # 若 ML 欄位存在但**全部**為缺值，視同沒有 ML：直接回規則分數，
+    # 不可用排名或 0 冒充「模型已判讀為中性」。
+    if not merged["ml_score"].notna().any():
+        out["score"] = out["rule_score"]
+        return out.drop(columns=["rule_score"])
+
+    merged["rank_rule"] = (merged.groupby("date")["rule_score"]
+                           .transform(_rank_pct))
+    ml_present = merged["ml_score"].notna()
+    merged["rank_ml"] = merged.groupby("date")["ml_score"].transform(_rank_pct)
+
+    total = w_r + w_m or 1.0
+    fused = (merged["rank_rule"] * w_r + merged["rank_ml"] * w_m) / total
+    # 沒有 ML 的列：明確只用規則分數（避免用 0 冒充模型判讀）
+    merged["score"] = np.where(ml_present, fused, merged["rank_rule"])
+    return merged.drop(columns=["rank_rule", "rank_ml"])
 
 
 def pick_top_n(scores: pd.DataFrame, date: str, top_n: int = 5) -> pd.DataFrame:

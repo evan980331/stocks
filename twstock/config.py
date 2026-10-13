@@ -12,13 +12,16 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("TWSTOCK_DATA_DIR") or (PROJECT_ROOT / "data_store"))
 REPORTS_DIR = PROJECT_ROOT / "reports"
-# Vercel 等 serverless 環境：檔案系統唯讀且短暫，DB 必須由環境變數指定唯讀快照
+STATE_DIR = DATA_DIR / "state"        # PID 檔、停止旗標等執行狀態
 DB_PATH = Path(os.environ.get("TWSTOCK_DB_PATH") or (DATA_DIR / "twstock_v3.db"))
 
 
 def is_readonly() -> bool:
-    """唯讀模式：Vercel（VERCEL=1）或顯式 TWSTOCK_READONLY=1。"""
-    return bool(os.environ.get("VERCEL") or os.environ.get("TWSTOCK_READONLY"))
+    """唯讀保護模式：設定 TWSTOCK_READONLY=1 時只讀不寫（本機安全分析用）。
+
+    與任何雲端平台無關；本專案為本地優先架構。
+    """
+    return bool(os.environ.get("TWSTOCK_READONLY"))
 
 # 台股前百大市值中的代表池（初版 20 檔，涵蓋電子/傳產/金融）
 STOCK_POOL: dict[str, str] = {
@@ -69,7 +72,13 @@ class Config:
     # 訊號
     top_n: int = 5
     hold_days: int = 5                  # ML label = 未來 5 日超額報酬
-    max_position_pct: float = 0.20      # 單檔部位上限（ phase 3 收緊到 10%）
+    max_position_pct: float = 0.10      # 單檔部位上限（佔總資產）
+    # 回測成交假設
+    limit_pct: float = 0.10             # 漲跌停幅度（漲停/跌停當日無法成交）
+    # 訊號融合（規則分數與 ML 預測尺度不同，必須先轉成可比較的排名百分位）
+    fusion_method: str = "rank_percentile"
+    fusion_weight_rule: float = 0.6
+    fusion_weight_ml: float = 0.4
 
     @property
     def commission_effective(self) -> float:
