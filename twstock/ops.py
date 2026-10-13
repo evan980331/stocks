@@ -138,38 +138,80 @@ def _signal_stop(pid: int) -> bool:
         return False
 
 
+def _cleanup_state(name: str) -> None:
+    """行程確實結束後清除殘留狀態（PID 檔、停止旗標、Worker 鎖）。
+
+    不清理會造成假狀態：例如停止旗標還在會讓健康狀態一直顯示「正在停止」。
+    """
+    _pid_file(name).unlink(missing_ok=True)
+    (STATE_DIR / f"{name}.stop").unlink(missing_ok=True)
+    if name == "worker":
+        lock = STATE_DIR / f"{name}.lock"
+        holder = None
+        if lock.exists():
+            try:
+                holder = int(lock.read_text(encoding="utf-8").strip().split()[0])
+            except (OSError, ValueError, IndexError):
+                holder = None
+        if holder is None or not pid_alive(holder):
+            lock.unlink(missing_ok=True)
+
+
 def stop(name: str, timeout: float = 20.0) -> bool:
-    """安全停止：先送停止旗標與可攔截訊號，逾時才強制終止。"""
+    """安全停止。
+
+    策略依元件而不同：
+      - **worker**：先寫停止旗標，讓它在下一個檢查點自行收尾（真實的優雅停止）；
+        只有在旗標未被理會時才送可攔截訊號，最後才強制終止。
+      - **dashboard**（uvicorn）：無法輪詢旗標，直接送可攔截訊號。
+
+    回傳值代表行程是否已結束，且**區分「自行收尾」與「被強制終止」**，
+    不把強制終止回報成安全停止。
+    """
     from .worker import request_stop
     pid = _read_pid(name)
     if pid is None:
+        _cleanup_state(name)
         print(f"[{name}] 未在執行")
-        _pid_file(name).unlink(missing_ok=True)
         return True
 
-    request_stop(name)      # worker 會於檢查點收尾
-    _signal_stop(pid)       # dashboard(uvicorn) 會攔截此訊號優雅關閉
+    cooperative = (name == "worker")
+    request_stop(name)                       # worker 會於檢查點收尾
+    if not cooperative:
+        _signal_stop(pid)                    # dashboard 攔截訊號優雅關閉
+
+    graceful = False
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not pid_alive(pid):
-            _pid_file(name).unlink(missing_ok=True)
-            print(f"[{name}] 已安全停止（PID {pid}）")
-            return True
+            graceful = True
+            break
         time.sleep(0.5)
 
-    log.warning("[%s] 未於 %.0fs 內自行結束，強制終止 PID %s", name, timeout, pid)
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, check=False)
-    else:
-        import signal
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    time.sleep(1.0)
-    _pid_file(name).unlink(missing_ok=True)
-    print(f"[{name}] 已強制停止（PID {pid}）")
+    if not graceful:
+        _signal_stop(pid)                    # 再試可攔截訊號
+        deadline = time.time() + min(5.0, timeout)
+        while time.time() < deadline:
+            if not pid_alive(pid):
+                graceful = True
+                break
+            time.sleep(0.3)
+
+    if not graceful:
+        log.warning("[%s] 未於 %.0fs 內自行結束，強制終止 PID %s", name, timeout, pid)
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, check=False)
+        else:
+            import signal
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(1.0)
+
+    _cleanup_state(name)
+    print(f"[{name}] {'已安全停止' if graceful else '已強制停止'}（PID {pid}）")
     return not pid_alive(pid)
 
 
@@ -245,9 +287,21 @@ def health() -> dict:
     except Exception as e:  # noqa: BLE001
         out["kill_switch"] = {"engaged": False, "reason": "", "error": str(e)}
 
+    wp = _read_pid("worker")
+    walive = bool(wp and pid_alive(wp))
+    try:
+        from .worker import derive_state, stop_requested
+        wstate = derive_state(
+            hb, stop_flag=stop_requested("worker"), pid_alive=walive,
+            data_staleness_days=out.get("data_staleness_days"))
+        state_value, state_label = wstate.value, wstate.label
+    except Exception as e:  # noqa: BLE001
+        state_value, state_label = "unknown", f"無法判定（{e}）"
     out["worker"] = {
-        "pid": _read_pid("worker"),
-        "alive": bool(_read_pid("worker") and pid_alive(_read_pid("worker") or 0)),
+        "pid": wp,
+        "alive": walive,
+        "state": state_value,
+        "state_label": state_label,
         "heartbeat": hb,
     }
     out["dashboard"] = {
@@ -281,9 +335,11 @@ def print_health() -> None:
     ks = h.get("kill_switch", {})
     print(f"  Kill Switch   {'已啟用 ' + ks.get('reason','') if ks.get('engaged') else '未啟用'}")
     w = h.get("worker", {})
-    wstate = "執行中" if w.get("alive") else "未執行"
     hbat = (w.get("heartbeat") or {}).get("at", "-")
-    print(f"  Worker        {wstate}  最後心跳 {hbat}")
+    last_result = (w.get("heartbeat") or {}).get("last_result", "")
+    print(f"  Worker        {w.get('state_label', '未執行')}  最後心跳 {hbat}")
+    if last_result:
+        print(f"                {last_result}")
     d = h.get("dashboard", {})
     print(f"  儀表板        {'執行中' if d.get('alive') else '未執行'}"
           f"{'  → http://127.0.0.1:8000' if d.get('alive') else ''}")

@@ -22,8 +22,8 @@ import sys
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-DATA_CMDS = ["ingest", "run", "backtest", "notify", "dashboard", "train", "all",
-             "experts", "ai", "advice"]
+DATA_CMDS = ["ingest", "run", "backtest", "validate", "notify", "dashboard",
+             "train", "all", "experts", "ai", "advice"]
 OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
 
 
@@ -101,6 +101,18 @@ def main() -> int:
     if args.cmd == "backtest":
         from .pipeline import run_backtest_cli
         print(run_backtest_cli())
+
+    if args.cmd == "validate":
+        # 樣本外驗證（P2.1）：時間序列切分 + 基準檢查 + 策略比較 + 成本敏感度
+        from .validation import run_validation
+        report = run_validation()
+        print(report.to_text())
+        import datetime as _dt
+        from .config import REPORTS_DIR
+        REPORTS_DIR.mkdir(exist_ok=True)
+        out = REPORTS_DIR / f"validation_{_dt.datetime.now():%Y%m%d_%H%M%S}.txt"
+        out.write_text(report.to_text() + "\n", encoding="utf-8")
+        print(f"\n（報告已寫入：{out}）")
 
     if args.cmd in ("notify", "all"):
         from .pipeline import daily_notify
