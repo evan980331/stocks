@@ -78,3 +78,37 @@ def test_limits_are_conservative_by_default():
     assert lim.max_position_pct <= 0.10
     assert lim.max_gross_exposure <= 0.60
     assert lim.max_data_staleness_days <= 3
+
+
+def test_kill_switch_blocks_even_when_live_and_acked(tmp_path, monkeypatch):
+    """即使模式為 live 且已明確 ack，Kill Switch 啟用時仍不得產生可執行動作。"""
+    monkeypatch.setenv("TWSTOCK_MODE", "live")
+    monkeypatch.setenv("TWSTOCK_LIVE_ACK", "1")
+    assert live_enabled() is True
+    ks = KillSwitch(tmp_path / "KILL_SWITCH")
+    ks.engage("行情過期")
+    d = kill_switch_decision(ks)
+    assert d.ok is False, "Kill Switch 啟用時不得放行"
+    assert d.reasons and "Kill Switch" in d.reasons[0]
+    # 決策只帶否決原因，不含任何可送出的委託內容
+    assert not hasattr(d, "order") and not hasattr(d, "action")
+
+
+def test_kill_switch_survives_process_restart(tmp_path):
+    """Kill Switch 以檔案落地：模擬 Worker 重啟（建立新實例）後仍必須有效，
+    不得因自動重啟而自動放行正式交易。"""
+    path = tmp_path / "KILL_SWITCH"
+    KillSwitch(path).engage("人工介入")
+    restarted = KillSwitch(path)              # 等同新程序重新讀取
+    assert restarted.engaged() is True
+    assert kill_switch_decision(restarted).ok is False
+
+
+def test_kill_switch_requires_explicit_release(tmp_path):
+    """只有明確 release 才能解除；僅重新啟動或重新建立物件不得解除。"""
+    path = tmp_path / "KILL_SWITCH"
+    KillSwitch(path).engage("異常")
+    assert KillSwitch(path).engaged() is True
+    KillSwitch(path).release()
+    assert KillSwitch(path).engaged() is False
+    assert kill_switch_decision(KillSwitch(path)).ok is True
