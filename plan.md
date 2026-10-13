@@ -389,11 +389,13 @@ python -m pytest -q
 | B14 | `TaiwanStockPriceAdj` 為 FinMind 付費層，故自行還原 | 低 | `DONE`（改用事件檔） |
 | B4 | 股票池為寫死的 20 檔，未處理下市/新上市/成分變動 → survivorship 風險 | 中 | `TODO` |
 | B5 | 月營收點時（point-in-time）僅以 `date` 近似，未用公告時間 | 中 | `TODO` |
-| B6 | 無 Worker 持續排程與崩潰恢復的完整實作 | 中 | `IN_PROGRESS`（P3） |
+| B6 | Worker 已具單實例鎖／逾時／重試／九態健康，但**未實作跨程序崩潰後的自動接續**（重啟後需人工確認未完成任務） | 中 | `DONE`（P3.1 硬化）；殘餘風險見 B15 |
 | B7 | 尚無模擬券商 / 委託狀態機 / Kill Switch | 高 | `TODO`（P4） |
-| B8 | 未實作樣本外切分與參數敏感度報告 | 中 | `TODO`（P2 後半） |
+| B8 | 樣本外切分與參數敏感度報告 | 中 | `DONE`（W13/W14，`cli validate` 可重跑） |
 | B9 | `store.upsert()` 為死碼且含 `if_exists="replace"` 危險寫法 | 低 | 已移除（W3） |
 | B10 | Vercel 相關痕跡（`.vercel/` 本機目錄） | 低 | 已清理設定檔 |
+| B15 | Worker 逾時偵測為**事後判定**，無法真正中止已在執行的耗時任務（Python 執行緒無法安全 kill） | 中 | `DONE`（有記錄）；需改為子程序架構才能強制中止 |
+| B16 | 公司行動僅以事件檔還原，無獨立還原來源可交叉驗證（校正後跳動已與序列一致） | 低 | `TODO`（付費 `TaiwanStockPriceAdj` 可交叉比對） |
 
 ---
 
@@ -429,15 +431,24 @@ python -m pytest -q
 
 ---
 
-## 本輪 commit
+## 本輪 commit（P2.1 / P2.2 / P3.1，2026-10-13，已 push 至 `origin/main`）
 
 | 順序 | SHA | 訊息 | 內容 |
 |---|---|---|---|
-| 1 | `56b63b6` | `fix(quant): 修正資料完整性與回測 look-ahead…` | store/sentiment/finmind/pipeline/ml_model/signals/backtest/config + 6 個回歸測試 |
-| 2 | `a5f4b5d` | `feat(local): 新增風險控制、監控 Worker 與本地服務生命週期` | risk/worker/ops/cli/app + run.bat + 2 個測試 |
-| 3 | 本文件所在 commit | `chore: 移除雲端部署依賴，改為本地優先` | 刪除 vercel 相關檔、更新 README/.env.example/.gitignore、plan.md、docs/ |
+| 1 | `76c64ee` | `fix(data): 還原除權息與分割，並把無效價格視為缺值` | data/quality.py、data/loader.py、pipeline、features、store、finmind_client + `test_data_quality.py` |
+| 2 | `80a32c2` | `feat(quant): 樣本外驗證流程、成本敏感度分析與精確週轉率` | costs.py、strategies.py、backtest.py、validation.py、signals.py + `test_costs_turnover.py`、`test_validation.py` |
+| 3 | `3ff2b3a` | `fix(worker): 單實例鎖、逾時與重試、明確健康狀態，並修正「假安全停止」` | worker.py、ops.py、cli.py + `test_worker_hardening.py`、`test_ops_lifecycle.py` |
+| 4 | `b180ffa` | `docs: 記錄 P2.1/P2.2/P3.1 結果、週轉率公式與成本假設` | plan.md、docs/STATUS_REPORT.md、README.md |
 
-每個 commit 皆為可獨立驗證的工作單位（以 `pytest` 確認）。
+每個 commit 皆為可獨立驗證的工作單位（各自於提交前以對應 `pytest` 確認）。
+
+### 更早的 commit
+
+| 順序 | SHA | 訊息 |
+|---|---|---|
+| 1 | `56b63b6` | `fix(quant): 修正資料完整性與回測 look-ahead…` |
+| 2 | `a5f4b5d` | `feat(local): 新增風險控制、監控 Worker 與本地服務生命週期` |
+| 3 | `d150b58` | `chore: 移除雲端部署依賴，改為本地優先` |
 
 ## 最後驗證（P2.1 / P2.2 / P3.1，2026-10-13）
 
@@ -449,6 +460,10 @@ python -m pytest -q
   → `stop worker` **1.77 秒**自行收尾，心跳 `stopped`、鎖與停止旗標已清除
 - 資料還原實測：0050 分割日報酬 −74.8% → +0.9%；2317 無效列已剔除；
   公司行動共 41 筆套用
+- 全期（2.20 年）`backtest`：年化 +14.63%、Sharpe 1.18、MDD −14.54%、456 筆、
+  週轉率累積雙邊 **96.16x**；同期 0050 買進持有年化 +51.56% → 超額 **−114.48%**
+- 待驗證基準 94.72x 已對上（同一累積雙邊定義；差異來自還原後價格與剔除無效列）
+- 正式退出碼：`pytest` 0、`cli validate` 0、`cli backtest` 0
 
 ### 前一輪驗證（P0/P1/P2 基礎，2026-10-13）
 
