@@ -87,6 +87,7 @@ th {{ color:#7fd1ff; font-weight:600; }}
 .ai-loading {{ color:#8b95a7; }}
 </style></head><body>
 <h1>📊 台股預測儀表板</h1>
+<p id="statusStrip" style="color:#aeb8cc;font-size:13px;margin:0 0 14px">{status_strip}</p>
 <div class="grid">
   <div class="card"><h3>🎯 最新訊號 Top {topn}</h3>{signals_table}</div>
   <div class="card"><h3>📰 最新新聞情緒</h3>{news_table}</div>
@@ -192,13 +193,63 @@ def _df_to_html(df: pd.DataFrame, cols: list[str],
     return d.to_html(index=False, border=0, classes="", justify="left", escape=False)
 
 
+def _ensure_actions(df: pd.DataFrame) -> pd.DataFrame:
+    """action 欄若未落庫則即時計算，避免儀表板一律顯示「持有」而誤導。"""
+    from .signals import pick_top_n
+    df = df.copy()
+    if "action" not in df.columns:
+        df["action"] = None
+    if df["action"].isna().all() and len(df):
+        date = df["date"].iloc[0]
+        top = pick_top_n(df, date, top_n=len(df))
+        df["action"] = df["stock_id"].map(
+            top.set_index("stock_id")["action"]).fillna("HOLD")
+    else:
+        df["action"] = df["action"].fillna("HOLD")
+    return df
+
+
+def _status_strip() -> str:
+    """資料新鮮度與系統狀態（全部來自真實執行狀態，不用假資料）。"""
+    try:
+        from .ops import health
+        h = health()
+    except Exception as e:  # noqa: BLE001
+        return html_lib.escape(f"狀態無法取得：{e}")
+    parts = [f"模式 {h.get('mode')}"]
+    parts.append(f"最新行情 {h.get('latest_price_date') or '無'}")
+    stale = h.get("data_staleness_days")
+    if stale is not None:
+        parts.append(f"延遲 {stale} 天" + (" ⚠️" if stale > 3 else ""))
+    parts.append(f"最新訊號 {h.get('latest_signal_date') or '無'}")
+    ml = h.get("ml", {})
+    parts.append("ML " + ("可用" if ml.get("available") else f"停用({ml.get('reason','')})"))
+    ks = h.get("kill_switch", {})
+    if ks.get("engaged"):
+        parts.append("🛑 Kill Switch 已啟用")
+    w = h.get("worker", {})
+    hb = (w.get("heartbeat") or {}).get("at")
+    parts.append("Worker " + ("執行中" if w.get("alive") else "未執行") +
+                 (f"（心跳 {hb}）" if hb else ""))
+    if h.get("last_ingest_failed_ids"):
+        parts.append("⚠️ ingest 失敗：" + str(h["last_ingest_failed_ids"]))
+    return html_lib.escape(" ｜ ".join(str(p) for p in parts))
+
+
+@app.get("/api/health")
+def api_health() -> dict:
+    """系統健康狀態（供本機監控與 script 檢查）。"""
+    from .ops import health
+    return jsonable_encoder(health())
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     sig = store.read_sql(
         "SELECT * FROM signals WHERE date=(SELECT MAX(date) FROM signals) "
         "ORDER BY score DESC LIMIT 8")
     if not sig.empty:
-        sig["action"] = sig["action"].fillna("HOLD")
+        sig = _ensure_actions(sig)
         sig["stock_name"] = sig["stock_id"].map(_cn_name)
         sig = sig.sort_values("score", ascending=False).reset_index(drop=True)
         sig["rank"] = range(1, len(sig) + 1)
@@ -227,23 +278,20 @@ def index() -> str:
                 "close", "volume"],
         num_cols=("open", "high", "low", "close", "volume"))
     return HTML.format(topn=CONFIG.top_n, signals_table=sig_html,
-                       news_table=news_html, price_table=price_html)
+                       news_table=news_html, price_table=price_html,
+                       status_strip=_status_strip())
 
 
 @app.get("/api/signals")
 def api_signals() -> list[dict]:
     """最新一期訊號；rank/action 若未落庫則即時計算。"""
-    from .signals import pick_top_n
     df = store.read_sql(
         "SELECT * FROM signals WHERE date=(SELECT MAX(date) FROM signals) "
         "ORDER BY score DESC"
     )
     if df.empty:
         return []
-    if df["action"].isna().all():
-        top = pick_top_n(df, df["date"].iloc[0], top_n=len(df))
-        df["action"] = df["stock_id"].map(
-            top.set_index("stock_id")["action"]).fillna("HOLD")
+    df = _ensure_actions(df)
     df["rank"] = range(1, len(df) + 1)
     return jsonable_encoder(df.to_dict(orient="records"))
 

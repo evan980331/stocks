@@ -1,4 +1,18 @@
-"""CLI: python cli.py {ingest|run|backtest|notify|dashboard|train}"""
+"""CLI 唯一進入點。
+
+資料/分析：
+  ingest | run | backtest | train | notify | experts | ai
+
+本地服務生命週期：
+  dashboard（前景） | worker（前景）
+  start <dashboard|worker> | stop [name|all] | restart <name> | status | health
+
+範例：
+  python -m twstock.cli ingest
+  python -m twstock.cli run
+  python -m twstock.cli start worker
+  python -m twstock.cli health
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,18 +22,74 @@ import sys
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+DATA_CMDS = ["ingest", "run", "backtest", "notify", "dashboard", "train", "all",
+             "experts", "ai", "advice"]
+OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
+
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="台股預測系統 CLI")
-    ap.add_argument("cmd", choices=["ingest", "run", "backtest", "notify",
-                                    "dashboard", "train", "all",
-                                    "experts", "ai", "advice"])
+    ap = argparse.ArgumentParser(description="台股本地量化系統 CLI")
+    ap.add_argument("cmd", choices=DATA_CMDS + OPS_CMDS)
+    ap.add_argument("name", nargs="?",
+                    help="服務元件名稱（start/stop/restart 用，可為 dashboard|worker|all）")
     ap.add_argument("--stocks", nargs="*", default=None,
                     help="指定股票代碼（預設為整個 pool）")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="儀表板綁定位址（預設僅本機 127.0.0.1）")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--interval", type=int, default=1800,
+                    help="Worker 每輪間隔秒數")
+    ap.add_argument("--once", action="store_true", help="Worker 只執行一次")
     args = ap.parse_args()
 
+    # ---- 服務生命週期 ----
+    if args.cmd == "start":
+        from . import ops
+        if not args.name:
+            ap.error("start 需要元件名稱：dashboard | worker")
+        if args.name == "all":
+            for comp in ops.COMPONENTS:
+                ops.start(comp, ["--interval", str(args.interval)] if comp == "worker" else [])
+            return 0
+        extra = ["--port", str(args.port)] if args.name == "dashboard" else \
+            ["--interval", str(args.interval)]
+        ops.start(args.name, extra)
+        return 0
+
+    if args.cmd == "stop":
+        from . import ops
+        if args.name in (None, "all"):
+            ops.stop_all()
+        else:
+            ops.stop(args.name)
+        return 0
+
+    if args.cmd == "restart":
+        from . import ops
+        if not args.name or args.name == "all":
+            ap.error("restart 需要元件名稱：dashboard | worker")
+        ops.stop(args.name)
+        extra = ["--port", str(args.port)] if args.name == "dashboard" else \
+            ["--interval", str(args.interval)]
+        ops.start(args.name, extra)
+        return 0
+
+    if args.cmd == "status":
+        from . import ops
+        print("=== 服務狀態 ===")
+        ops.print_status()
+        return 0
+
+    if args.cmd == "health":
+        from . import ops
+        ops.print_health()
+        return 0
+
+    if args.cmd == "worker":
+        from .worker import run_forever
+        return run_forever(interval=args.interval, force_once=args.once)
+
+    # ---- 資料與分析 ----
     if args.cmd in ("ingest", "all"):
         from .pipeline import ingest
         ingest(args.stocks)
@@ -28,7 +98,7 @@ def main() -> int:
         df = run_scores(args.stocks)
         print(df.tail(20) if not df.empty else "無資料")
 
-    if args.cmd in ("backtest",):
+    if args.cmd == "backtest":
         from .pipeline import run_backtest_cli
         print(run_backtest_cli())
 
@@ -36,7 +106,7 @@ def main() -> int:
         from .pipeline import daily_notify
         daily_notify()
 
-    if args.cmd in ("dashboard",):
+    if args.cmd == "dashboard":
         import uvicorn
         from .app import app
         uvicorn.run(app, host=args.host, port=args.port)
@@ -54,10 +124,10 @@ def main() -> int:
             print(gemini.rule_based_advice())
 
     if args.cmd == "train":
-        from .pipeline import load_panel
+        from .pipeline import load_benchmark, load_panel
         from .ml_model import train_walk_forward
         panel, _ = load_panel()
-        model, meta = train_walk_forward(panel)
+        model, meta = train_walk_forward(panel, load_benchmark())
         print(meta)
 
     return 0
