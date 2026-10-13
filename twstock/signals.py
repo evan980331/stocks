@@ -80,8 +80,14 @@ def _z(x: pd.Series) -> pd.Series:
     return (s - s.mean()) / std if std and std > 0 else s * 0.0
 
 
-def score_row(row: pd.Series) -> tuple[float, str]:
-    parts: list[tuple[float, float, str]] = []
+def _factor_parts(row: pd.Series) -> list[tuple[str, float, str]]:
+    """各因子的 (因子鍵, 方向化數值, 顯示名稱)。
+
+    方向化數值：**正 = 偏多、負 = 偏空**，-1 ~ +1。此函式是唯一的因子計算來源，
+    ``score_row``（合成總分）與 ``score_components``（P2.3 逐因子診斷）共用它，
+    確保診斷分析的就是策略真正採用的訊號，而非另寫一份近似版本。
+    """
+    parts: list[tuple[str, float, str]] = []
 
     # ===== K 線綜合（KD + MACD + 型態）=====
     kl = row.get("kline_score", np.nan)
@@ -110,64 +116,80 @@ def score_row(row: pd.Series) -> tuple[float, str]:
                 name = "macd_dn"
             else:
                 name = "kline_dn"
-        parts.append((WEIGHTS["kline"], _clip(float(kl)), name))
+        parts.append(("kline", _clip(float(kl)), name))
 
     # ===== 20 日突破 / 破線 =====
     bo = row.get("breakout20", 0) or 0
     bd = row.get("breakdown20", 0) or 0
     if bo:
-        parts.append((WEIGHTS["breakout"], 1.0, "breakout"))
+        parts.append(("breakout", 1.0, "breakout"))
     elif bd:
-        parts.append((WEIGHTS["breakout"], -1.0, "breakdown"))
+        parts.append(("breakout", -1.0, "breakdown"))
 
     mom20 = row.get("mom_20", np.nan)
     mom60 = row.get("mom_60", np.nan)
-    parts.append((WEIGHTS["mom_20"], _clip(mom20 * 5), "mom20"))
-    parts.append((WEIGHTS["mom_60"], _clip((mom60 or 0) * 2.5), "mom60"))
+    parts.append(("mom_20", _clip(mom20 * 5), "mom20"))
+    parts.append(("mom_60", _clip((mom60 or 0) * 2.5), "mom60"))
 
-    parts.append((WEIGHTS["ma_alignment"],
+    parts.append(("ma_alignment",
                   1.0 if row.get("ma_alignment", 0) == 1 else -0.3, "ma"))
 
     rsi_v = row.get("rsi", np.nan)
     if pd.notna(rsi_v):
         if rsi_v < 30:
-            parts.append((WEIGHTS["rsi_rev"], 0.8, "rsi_os"))
+            parts.append(("rsi_rev", 0.8, "rsi_os"))
         elif rsi_v > 70:
-            parts.append((WEIGHTS["rsi_rev"], -0.6, "rsi_ob"))
+            parts.append(("rsi_rev", -0.6, "rsi_ob"))
         else:
-            parts.append((WEIGHTS["rsi_rev"], 0.0, "rsi"))
+            parts.append(("rsi_rev", 0.0, "rsi"))
 
     vr = row.get("vol_ratio", np.nan)
     if pd.notna(vr) and vr > 1.5:
         # 放量方向跟當日漲跌
         ret = row.get("ret_1d", 0) or 0
-        parts.append((WEIGHTS["vol_ratio"], 0.6 if ret > 0 else -0.6, "volume"))
+        parts.append(("vol_ratio", 0.6 if ret > 0 else -0.6, "volume"))
 
     inst3 = row.get("inst_net_sum3", np.nan)
     if pd.notna(inst3):
-        parts.append((WEIGHTS["inst_net_sum3"],
+        parts.append(("inst_net_sum3",
                       _clip(inst3 / max(1e6, abs(inst3)) * 1e6 / 5e7), "inst3"))
     streak = row.get("streak_inst_buy", 0) or 0
     if streak >= 3:
-        parts.append((WEIGHTS["streak_inst_buy"], min(1.0, streak / 8), "inst_streak"))
+        parts.append(("streak_inst_buy", min(1.0, streak / 8), "inst_streak"))
 
     mr = row.get("margin_ratio", np.nan)
     if pd.notna(mr):
         # 券資比 < 0.35 偏多（軋空空間），> 0.6 偏空
-        parts.append((WEIGHTS["margin_ratio"], _clip((0.35 - mr) * 4), "margin"))
+        parts.append(("margin_ratio", _clip((0.35 - mr) * 4), "margin"))
 
     yoy = row.get("rev_yoy", np.nan)
     if pd.notna(yoy):
-        parts.append((WEIGHTS["rev_yoy"], _clip(float(yoy) / 30.0), "rev_yoy"))
+        parts.append(("rev_yoy", _clip(float(yoy) / 30.0), "rev_yoy"))
 
     ns = row.get("news_sentiment", np.nan) if "news_sentiment" in row else np.nan
     if pd.notna(ns):
-        parts.append((WEIGHTS["news_sentiment"], _clip(float(ns) * 1.5), "news"))
+        parts.append(("news_sentiment", _clip(float(ns) * 1.5), "news"))
 
-    total_w = sum(w for w, _, _ in parts)
+    return parts
+
+
+def score_components(row: pd.Series) -> dict[str, float]:
+    """逐因子方向化數值（正 = 偏多），鍵為 ``WEIGHTS`` 的因子名。
+
+    供 P2.3 訊號資訊量診斷使用；與 ``score_row`` 共用 ``_factor_parts``，
+    因此分析對象就是策略實際採用的訊號。缺值因子**不會**出現在回傳字典中，
+    交由呼叫端明確視為缺值，不以 0 冒充「中性」。
+    """
+    return {key: float(value) for key, value, _name in _factor_parts(row)}
+
+
+def score_row(row: pd.Series) -> tuple[float, str]:
+    parts = _factor_parts(row)
+    total_w = sum(WEIGHTS[key] for key, _, _ in parts)
     if total_w == 0:
         return 0.0, "資料不足"
-    score = sum(w * v for w, v, _ in parts) / total_w
+    score = sum(WEIGHTS[key] * v for key, v, _ in parts) / total_w
+    # 只有非零權重的因子才進 reasons，且與原本邏輯一致（v > 0.15）
     reasons = [NAME_CN.get(name, name) for _, v, name in parts if v > 0.15]
     return float(np.clip(score, -1, 1)), "、".join(reasons) or "持平"
 
