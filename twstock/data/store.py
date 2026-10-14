@@ -1,4 +1,4 @@
-"""SQLite 儲存層：price、institution、margin、revenue、news、signals、experts、ingest_log。
+"""SQLite 儲存層：price、institution、margin、revenue、news、signals、experts、ingest_log、ingest_run。
 
 寫入策略（重要）：
   所有寫入一律使用 ``INSERT OR REPLACE``（依各表 PRIMARY KEY 去重）。
@@ -7,6 +7,13 @@
 唯讀保護：
   ``TWSTOCK_READONLY=1`` 時完全不寫入，僅以 mode=ro 開啟，用於安全分析既有資料。
   （此機制與任何雲端平台無關，純粹是本機保護。）
+
+遷移原則（向後相容，絕不覆寫舊資料）：
+  - 新欄位一律以 ``ALTER TABLE ... ADD COLUMN`` 補上（既有列得到 NULL）。
+  - 舊資料的**狀態不可追溯**：``news.provenance``／``timestamp_source`` 補為
+    ``'unknown'``，不得推測當時抓取是否成功。
+  - 舊 ``ingest_log`` 只有布林 ``ok``，無從得知是「成功有資料」還是「成功無資料」，
+    故一次性回填到 ``ingest_run`` 時一律標為 ``unknown``（由 ``meta`` 鍵守門，只做一次）。
 """
 from __future__ import annotations
 
@@ -54,6 +61,12 @@ CREATE TABLE IF NOT EXISTS revenue (
 CREATE TABLE IF NOT EXISTS news (
     published DATE, stock_id TEXT, title TEXT, link TEXT,
     score REAL, source TEXT,
+    published_at TEXT,     -- 來源聲稱的發布時間（未知時為 NULL，不臆測）
+    fetched_at TEXT,       -- 實際抓取時間（與發布時間必須可分）
+    timestamp_source TEXT, -- source：有來源時間；unknown：時間不可得
+    score_kind TEXT,       -- scored：有非零情緒分數；neutral：存在但中性；
+                           -- missing：無有效分數
+    provenance TEXT,       -- recorded：本階段之後；unknown：不可追溯的舊資料
     PRIMARY KEY (stock_id, link)
 );
 CREATE TABLE IF NOT EXISTS signals (
@@ -76,6 +89,20 @@ CREATE TABLE IF NOT EXISTS ingest_log (
     ok INTEGER, rows INTEGER, error TEXT,
     PRIMARY KEY (run_at, stock_id, dataset)
 );
+-- 擷取狀態治理：每次執行留下去重、可重建、向後相容的紀錄。
+-- ok/rows 的布林語意不足以區分「成功但無資料」與「失敗」，故另立此表。
+CREATE TABLE IF NOT EXISTS ingest_run (
+    run_id TEXT, dataset TEXT, stock_id TEXT,
+    run_at TEXT, source TEXT, task TEXT,
+    started_at TEXT, ended_at TEXT,
+    status TEXT, error_class TEXT, error TEXT,
+    rows_fetched INTEGER, rows_parsed INTEGER,
+    rows_validated INTEGER, rows_written INTEGER,
+    data_start TEXT, data_end TEXT,
+    attempts INTEGER, source_version TEXT, config_id TEXT,
+    provenance TEXT, notes TEXT,
+    PRIMARY KEY (run_id, dataset, stock_id)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY, value TEXT
 );
@@ -92,8 +119,12 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "experts": ("source", "link"),
     "corporate_actions": ("stock_id", "date", "kind"),
     "ingest_log": ("run_at", "stock_id", "dataset"),
+    "ingest_run": ("run_id", "dataset", "stock_id"),
     "meta": ("key",),
 }
+
+# 舊資料無法追溯的標記值（與 twstock.data.status 一致；此處不 import 以避免循環）
+UNKNOWN_PROVENANCE = "unknown"
 
 
 def _ensure_dir() -> None:
@@ -118,10 +149,13 @@ def _init(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """輕量向前相容遷移：補上舊 DB 缺少的欄位。"""
+    """輕量向前相容遷移：補上舊 DB 缺少的欄位，並標記不可追溯的舊資料。"""
     wanted = {
         "signals": [("ml_score", "REAL")],
         "price": [("amount", "REAL"), ("turnover", "REAL")],
+        "news": [("published_at", "TEXT"), ("fetched_at", "TEXT"),
+                 ("timestamp_source", "TEXT"), ("score_kind", "TEXT"),
+                 ("provenance", "TEXT")],
     }
     for table, cols in wanted.items():
         existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -131,6 +165,86 @@ def _migrate(conn: sqlite3.Connection) -> None:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
                 log.info("migrate: %s 新增欄位 %s", table, name)
+    _mark_legacy_news(conn)
+    _backfill_ingest_run(conn)
+
+
+def _meta_get(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, value))
+
+
+def _mark_legacy_news(conn: sqlite3.Connection) -> None:
+    """把本階段之前寫入的新聞標為不可追溯。
+
+    可以重建的只有**分數本身是否存在**：``score`` 欄位就是直接證據
+    （NULL → missing、0 → neutral、其餘 → scored）。
+    但當時**抓取是否成功**無從得知，故 ``provenance`` 與 ``timestamp_source``
+    一律標為 ``unknown``，絕不補猜成功。只處理尚未標記的列，可重複執行且不覆寫。
+    """
+    if _meta_get(conn, "news_legacy_marked"):
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(news)").fetchall()}
+    if not cols:
+        return
+    conn.execute(
+        "UPDATE news SET provenance=? WHERE provenance IS NULL",
+        (UNKNOWN_PROVENANCE,))
+    conn.execute(
+        "UPDATE news SET timestamp_source=? WHERE timestamp_source IS NULL",
+        (UNKNOWN_PROVENANCE,))
+    if "score_kind" in cols:
+        conn.execute(
+            "UPDATE news SET score_kind='missing' WHERE score_kind IS NULL "
+            "AND score IS NULL")
+        conn.execute(
+            "UPDATE news SET score_kind='neutral' WHERE score_kind IS NULL "
+            "AND score = 0")
+        conn.execute(
+            "UPDATE news SET score_kind='scored' WHERE score_kind IS NULL")
+    n = conn.execute("SELECT COUNT(*) FROM news WHERE provenance=?",
+                     (UNKNOWN_PROVENANCE,)).fetchone()[0]
+    _meta_set(conn, "news_legacy_marked", dt.datetime.now().isoformat(
+        timespec="seconds"))
+    _meta_set(conn, "news_legacy_unknown_rows", str(int(n)))
+    log.info("migrate: %d 列既有新聞標記為不可追溯（unknown）", int(n))
+
+
+def _backfill_ingest_run(conn: sqlite3.Connection) -> None:
+    """把舊 ``ingest_log`` 一次性回填到 ``ingest_run``，狀態一律 unknown。
+
+    ``ingest_log.ok`` 只區分「有回應」與「呼叫失敗」，無法分辨「成功有資料」與
+    「成功但無資料」；因此回填時不得推論，一律記為 unknown。以 meta 鍵守門，
+    只做一次，且不覆寫既有（新的、狀態明確的）紀錄。
+    """
+    if _meta_get(conn, "ingest_run_backfilled"):
+        return
+    has_log = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_log'"
+    ).fetchone()
+    if not has_log:
+        return
+    rows = conn.execute(
+        "SELECT run_at, stock_id, dataset, ok, rows, error FROM ingest_log"
+    ).fetchall()
+    for run_at, stock_id, dataset, ok, nrows, error in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO ingest_run ("
+            "run_id, dataset, stock_id, run_at, source, task, "
+            "status, error_class, error, rows_written, attempts, "
+            "provenance, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"legacy:{run_at}", dataset or "", stock_id or "", run_at or "",
+             "legacy", dataset or "", "unknown", "unknown", error or "",
+             int(nrows or 0), 0, UNKNOWN_PROVENANCE,
+             "由 ingest_log 回填；當時無法區分成功有資料與成功無資料"))
+    _meta_set(conn, "ingest_run_backfilled",
+              dt.datetime.now().isoformat(timespec="seconds"))
+    if rows:
+        log.info("migrate: 回填 %d 筆舊 ingest_log 為 unknown 狀態", len(rows))
 
 
 def _adapt(v: Any) -> Any:
@@ -152,6 +266,11 @@ def _adapt(v: Any) -> Any:
     return v
 
 
+class WriteRejected(RuntimeError):
+    """寫入被拒絕（欄位無交集、表不存在）。此前只寫 log 並回 0，
+    會讓呼叫端把「完全沒寫入」誤記為成功。"""
+
+
 def write_df(df: pd.DataFrame, table: str,
              key_cols: Sequence[str] | None = None) -> int:
     """以 INSERT OR REPLACE 寫入 DataFrame。
@@ -159,6 +278,8 @@ def write_df(df: pd.DataFrame, table: str,
     - 僅寫入該表已存在的欄位（容忍來源欄位變動）。
     - 依主鍵去重，重跑同一任務不會產生重複、也不會刪掉其他標的的資料。
     - 回傳實際寫入列數。
+    - 有資料但**無交集欄位**時擲出 ``WriteRejected``，不再靜默回 0，
+      以免呼叫端把完全沒寫入當成成功。
     """
     if df is None or df.empty:
         return 0
@@ -168,10 +289,14 @@ def write_df(df: pd.DataFrame, table: str,
     try:
         _init(conn)
         known = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not known:
+            log.warning("write_df: 表 %s 不存在，拒絕寫入", table)
+            raise WriteRejected(f"表 {table} 不存在")
         cols = [c for c in df.columns if c in known]
         if not cols:
-            log.warning("write_df: %s 無交集欄位，略過", table)
-            return 0
+            log.warning("write_df: %s 無交集欄位，拒絕寫入", table)
+            raise WriteRejected(
+                f"表 {table} 與來源欄位無交集（{len(df)} 列未寫入）")
         keys = tuple(key_cols or PRIMARY_KEYS.get(table, ()))
         on_conflict = ""
         if keys and all(k in known for k in keys):
@@ -239,7 +364,12 @@ def set_meta(key: str, value: str) -> None:
 
 def log_ingest(run_at: str, stock_id: str, dataset: str, ok: bool,
                rows: int = 0, error: str = "") -> None:
-    """記錄單一 (run, stock, dataset) 的抓取結果，供健康檢查與失敗重試。"""
+    """記錄單一 (run, stock, dataset) 的抓取結果，供健康檢查與失敗重試。
+
+    保留舊介面（既有測試與呼叫端相依）；新程式碼請改用
+    ``twstock.data.status.IngestRecord`` / ``write_records``，才能區分
+    「成功有資料」與「成功但無資料」。
+    """
     write_df(pd.DataFrame([{
         "run_at": run_at, "stock_id": stock_id, "dataset": dataset,
         "ok": 1 if ok else 0, "rows": int(rows), "error": error,
