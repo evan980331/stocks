@@ -521,7 +521,39 @@ python -m pytest -q
 
 ---
 
-## 本輪 commit（P2.3 / P2.4 / P2.5 / P3.2，2026-10-14，已 push 至 `origin/main`）
+## 本輪 commit（P2.6，2026-10-14，已 push 至 `origin/main`）
+
+起始 HEAD = `293c34d`；結束 HEAD 見文末。無 force push、未覆蓋任何未提交修改。
+
+| 順序 | SHA | 訊息 | 內容 |
+|---|---|---|---|
+| 1 | `e8b97b1` | `feat(quant): B17 新聞因子消融驗證，分離分子與分母效應` | ablation.py、features.py（+`news_present`）、`test_ablation.py`（19） |
+| 2 | `107cabc` | `docs: 記錄 P2.6 消融結果，修正 B17 的量化描述與處置` | ABLATION_B17.md、STATUS_REPORT.md、plan.md |
+| 3 | （本 commit） | `docs(plan): 補上本輪 commit 表與最終驗證紀錄` | plan.md |
+
+每個 commit 皆為可獨立驗證的工作單位：`features.py` 的 `news_present` 為**純新增**
+（預設行為不變，既有測試不變即通過），方案實作與測試同單位落地。
+
+## 最後驗證（P2.6，2026-10-14）
+
+- `python -m pytest -q` → **253 passed**（正式退出碼 0；上階段 234，本階段 +19）
+- `python -m twstock.ablation` → 退出碼 0（完整報告，sims=500，14 個章節）
+- `python -m twstock.ablation --quick` → 退出碼 0
+- `python -m twstock.diagnostics --quick` → 退出碼 0（既有診斷未受影響）
+- `python -m twstock.cli validate` → 退出碼 0（既有驗證流程未受影響）
+- `python -m twstock.cli --help` → 退出碼 0
+- 工作目錄乾淨（`git status` 無輸出）
+- 簡體字掃描：變更檔案僅命中**共用字形**（影響／排序／涵蓋等）與正當的「核准」，
+  無簡體專用字。
+
+**本階段結論（回報第 5 項）**：B17 **會**改變排名（A→B 僅 80.9% 日相同）與成交
+（train/valid 有差），但在 train/valid **未**呈現一致且可解釋的改善（86 個配對假設
+校正後無一顯著、Rank IC 差符號翻轉、test 段 A ≡ B ≡ D 完全相同）
+→ **保留現行策略、記錄不確定性，不提出修改建議**。
+
+---
+
+## 上一輪 commit（P2.3 / P2.4 / P2.5 / P3.2，2026-10-14，已 push 至 `origin/main`）
 
 起始 HEAD = `3ae68ee`；結束 HEAD = `origin/main` = `2791fd0`。無 force push。
 
