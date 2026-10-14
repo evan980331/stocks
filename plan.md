@@ -459,7 +459,7 @@ Kill Switch 只「禁止新增正式委託」，**不刪除交易紀錄、不自
   修復前對抓取成敗與時間戳來源的可判定性都是 **0**。
 - **無聲失敗的直接證據**：`ingest_log` 163 筆**全部 `ok=1`**（其中新聞 20/20 皆為成功），
   這是舊程式硬編碼的結果而非證據 → 回填 `ingest_run` 時**一律標為 `unknown`**。
-- **驗證**：`pytest -q` → **296 passed**（上階段 253，+43 新增檔）；
+- **驗證**：`pytest -q` → **303 passed**（上階段 253，+50 新增檔）；
   `cli datacheck`／`validate`／`health`／`status`／`--help` 退出碼皆為 **0**。
 - **額外修正（本階段發現）**：測試套件原本會以可寫模式開啟**正式 DB**
   （`test_should_run_outside_trading_window` 未使用 `temp_db`）→ 執行 `pytest`
@@ -493,9 +493,10 @@ python -m pytest -q
 | `tests/test_ops_lifecycle.py` | 停止語意與狀態清理（W16） |
 | `tests/test_ingest_governance.py` | 擷取狀態治理：六態區分、新聞四態、網路／逾時／解析失敗、
   部分成功、寫入重試、幂等性、舊資料 `unknown`、未來新聞不外洩、時間不明
-  不得進訊號、Worker 不得把失敗記成完整成功、機密遮蔽（W23，43 項） |
+  不得進訊號、Worker 不得把失敗記成完整成功、機密遮蔽、以及真實
+  `pipeline.ingest()` 的紀錄完整性（W23，50 項） |
 
-**現況**：P0 基準 `14 passed` → 首輪修復後 **`55 passed`** → P2.7 後 **`296 passed`**。
+**現況**：P0 基準 `14 passed` → 首輪修復後 **`55 passed`** → P2.7 後 **`303 passed`**。
 
 實際執行項目與結果：
 
@@ -604,7 +605,9 @@ python -m pytest -q
 | 3 | `de6b82b` | `fix(worker): 依結構化狀態判定成敗，並新增資料品質檢查指令` | worker.py、ops.py、cli.py（`datacheck`）、`test_ingest_governance.py`（43） |
 | 4 | `5f4c1d7` | `docs: 記錄 P2.7 擷取狀態治理結果、資料品質統計與技術債` | README.md、plan.md、STATUS_REPORT.md、DATA_SOURCES.md |
 | 5 | `770abd0` | `refactor(data): 移除未使用的狀態與報告輔助函式` | status.py、sentiment.py、report.py、experts.py（不改變行為） |
-| 6 | （本 commit） | `docs(plan): 補上本輪 commit 表與最終驗證紀錄` | plan.md |
+| 6 | `2347fc6` | `docs(plan): 補上本輪 commit 表與最終驗證紀錄` | plan.md |
+| 7 | `6dcd595` | `fix(worker): 根資料集全失敗時仍須視為整輪失敗` | status.py、report.py（+每日筆數）、worker.py、`test_ingest_governance.py`（+7） |
+| 8 | （本 commit） | `docs: 同步 P2.7 最終數字與自我複核結果` | plan.md、STATUS_REPORT.md、README.md |
 
 **每個 commit 皆在 detached worktree 檢出完整快照獨立驗證過**（非只在最終狀態跑一次）：
 
@@ -612,7 +615,7 @@ python -m pytest -q
 |---|---|---|
 | `7cd9f3c` | worktree 檢出該快照後 `pytest -q` | **253 passed**（退出碼 0） |
 | `c08721c` | 同上 | **253 passed**（退出碼 0，且無 SyntaxWarning） |
-| `de6b82b` | 同上 | **296 passed**（退出碼 0） |
+| `de6b82b` | 同上 | **296 passed**（退出碼 0；當時新增檔為 43 項） |
 
 第 2 個 commit 因 `experts.py` 改了回傳型態，其呼叫端 `pipeline.ingest_experts`
 必須同一個 commit 落地（否則該快照的 `ingest_experts` 會拋 `ValueError`）——
@@ -622,7 +625,7 @@ python -m pytest -q
 
 | 命令 | 結果 | 退出碼 |
 |---|---|---:|
-| `python -m pytest -q` | **296 passed**（上階段 253，本階段 +43） | **0** |
+| `python -m pytest -q` | **303 passed**（上階段 253，本階段 +50） | **0** |
 | `python -m twstock.cli datacheck` | 新聞覆蓋率、抓取成功率／失敗率、狀態分佈 | **0** |
 | `python -m twstock.cli validate` | 既有驗證未受影響 | **0** |
 | `python -m twstock.cli health` | 新增顯示最近一輪各資料集擷取狀態 | **0** |
@@ -654,6 +657,16 @@ python -m pytest -q
    改了回傳型態）→ worktree 驗證時發現，已調整切分使該快照可獨立運作。
 3. 五個只有定義、沒有呼叫端的符號，以及一個未使用的匯入（已移除）。
 4. 文件初稿以簡體／異體字寫入（刪、拋）→ 已修正為繁體，並以字元掃描確認。
+5. **自己的改動造成安全性倒退（最嚴重的一項）**：`IngestSummary` 原本只看
+   「所有資料集是否都失敗」，所以**價量全數失敗、僅新聞成功**時不會拋錯，
+   會繼續用陳舊價格打分並產生看似正常的訊號；舊版程式在此情境是會中止的。
+   已改為以**根資料集（價量）** 判定（`root_all_failed()`），並補上針對這個
+   情境的回歸測試。
+6. 任務第 3.6 節要求報告「明確顯示每日新聞筆數」，我只計算卻**沒有輸出** →
+   已補上每日明細表格（`daily_news_counts()` 為唯一算法來源）。
+
+> 這六項都是交付前自行複核（包含對真實 DB 副本量測、對自己的紀錄做欄位完整性
+> 檢查、以及清點只有定義沒有呼叫端的符號）才發現的，不是一次就寫對。
 
 ---
 
