@@ -2,6 +2,7 @@
 
 資料/分析：
   ingest | run | backtest | train | notify | experts | ai
+  validate（樣本外驗證） | datacheck（資料品質與擷取狀態）
 
 本地服務生命週期：
   dashboard（前景） | worker（前景）
@@ -10,6 +11,7 @@
 範例：
   python -m twstock.cli ingest
   python -m twstock.cli run
+  python -m twstock.cli datacheck
   python -m twstock.cli start worker
   python -m twstock.cli health
 """
@@ -23,7 +25,7 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 DATA_CMDS = ["ingest", "run", "backtest", "validate", "notify", "dashboard",
-             "train", "all", "experts", "ai", "advice"]
+             "train", "all", "experts", "ai", "advice", "datacheck"]
 OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
 
 
@@ -101,6 +103,11 @@ def main() -> int:
     if args.cmd == "backtest":
         from .pipeline import run_backtest_cli
         print(run_backtest_cli())
+
+    if args.cmd == "datacheck":
+        # 資料擷取狀態與新聞品質（只描述可信度，不產生任何績效結論）
+        from .data import report
+        print(report.build_report_text())
 
     if args.cmd == "validate":
         # 樣本外驗證（P2.1）：時間序列切分 + 基準檢查 + 策略比較 + 成本敏感度

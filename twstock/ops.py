@@ -271,6 +271,18 @@ def health() -> dict:
             out["signal_rows"] = int(sig.iloc[0]["n"])
         out["last_ingest"] = store.get_meta("last_ingest")
         out["last_ingest_failed_ids"] = store.get_meta("last_ingest_failed_ids") or ""
+        # 擷取狀態治理：整體狀態與最近一輪的各資料集狀態（可辨識部分失敗）
+        out["last_ingest_run_id"] = store.get_meta("last_ingest_run_id")
+        out["last_ingest_status"] = store.get_meta("last_ingest_status")
+        out["last_experts_status"] = store.get_meta("last_experts_status")
+        try:
+            from .data import report
+            out["ingest_records"] = report.ingest_status_summary().to_dict(
+                orient="records")
+            out["news_fetch_rates"] = report.fetch_rates()
+        except Exception as e:  # noqa: BLE001
+            out["ingest_records"] = []
+            out["ingest_records_error"] = str(e)
     except Exception as e:  # noqa: BLE001
         out["db_error"] = str(e)
 
@@ -330,6 +342,25 @@ def print_health() -> None:
     print(f"  最新訊號日期  {h.get('latest_signal_date')}  訊號列數 {h.get('signal_rows')}")
     print(f"  最後 ingest   {h.get('last_ingest')}"
           f"{'  失敗標的: ' + h['last_ingest_failed_ids'] if h.get('last_ingest_failed_ids') else ''}")
+    if h.get("last_ingest_status"):
+        from .data.status import IngestStatus
+        try:
+            st_label = IngestStatus(h["last_ingest_status"]).label
+        except ValueError:
+            st_label = str(h["last_ingest_status"])
+        print(f"  擷取狀態      {st_label}"
+              f"（run {h.get('last_ingest_run_id') or '-'}）")
+    for row in h.get("ingest_records") or []:
+        print(f"    - {row.get('dataset','?'):<18} {row.get('status_label','?')}"
+              f" × {row.get('n','?')}")
+    rates = h.get("news_fetch_rates") or {}
+    if rates:
+        def _p(v):
+            return "—" if v is None else f"{v:.0%}"
+        print(f"  新聞抓取      成功 {_p(rates.get('success_rate'))}"
+              f"／失敗 {_p(rates.get('failure_rate'))}"
+              f"／不可追溯 {_p(rates.get('untraceable_rate'))}"
+              f"（紀錄 {rates.get('n_records', 0)}）")
     ml = h.get("ml", {})
     print(f"  ML 模型       {'可用' if ml.get('available') else '停用'} {ml.get('reason','')}")
     ks = h.get("kill_switch", {})

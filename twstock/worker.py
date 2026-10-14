@@ -307,12 +307,22 @@ def _compute_data_staleness() -> int | None:
             return None
         d = dt.datetime.fromisoformat(str(latest)[:10]).date()
         return (dt.date.today() - d).days
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        # 無法判定延遲時不可謊報新鮮；記錄原因並回 None（狀態顯示為未知）
+        log.warning("無法計算行情延遲：%s", e)
         return None
 
 
 def run_cycle(force: bool = False) -> str:
-    """執行一輪：判斷是否需要更新 → ingest → 打分。回傳狀態字串。"""
+    """執行一輪：判斷是否需要更新 → ingest → 打分。回傳狀態字串。
+
+    成敗判定改依**結構化擷取狀態**（``IngestSummary``），不再只數價量列數：
+      - 全部失敗（each record 皆 failed）→ 拋錯，Worker 記為 task_failed。
+      - 有部分失敗 → 回 ``partial_success``，Worker 心跳會顯示而**不**謊報全數成功。
+      - 來源正常但當日確實無資料 → 回 ``success_empty``，不是失敗。
+    不可只依整體退出碼推論「所有資料均成功」（§4.4）。
+    """
+    from .data import status as st
     from .pipeline import ingest, run_scores
 
     should, why = _should_run(force)
@@ -321,15 +331,30 @@ def run_cycle(force: bool = False) -> str:
         return why
 
     log.info("開始資料更新（%s）", why)
-    counts = ingest()
-    ok = sum(1 for v in counts.values() if v and v > 0)
-    if ok == 0:
-        log.error("本輪無任何價量更新成功，保留原有資料與時間戳")
-        raise RuntimeError("ingest 全部失敗")
+    summary = ingest()
+    if summary.all_failed:
+        log.error("本輪所有擷取皆失敗（%s），保留原有資料與時間戳", summary.label())
+        raise RuntimeError(f"ingest 全部失敗：{summary.label()}")
+
+    # 讓部分失敗可從可觀測狀態辨識，而不是只看退出碼
+    write_heartbeat(
+        ingest_run_id=summary.run_id,
+        ingest_status=summary.overall_status,
+        ingest_status_label=st.IngestStatus(summary.overall_status).label,
+        ingest_usable_records=summary.usable_count,
+        ingest_failed_records=summary.failed_count,
+        ingest_unknown_records=summary.unknown_count,
+        ingest_detail=summary.label())
 
     scores = run_scores()
     log.info("打分完成：%d 列", len(scores))
-    return "ok"
+    overall = summary.overall_status
+    if overall == st.IngestStatus.PARTIAL_SUCCESS.value:
+        log.warning("本輪有部分擷取失敗（%s）；訊號以現有可用資料計算",
+                    summary.label())
+    elif overall == st.IngestStatus.SUCCESS_EMPTY.value:
+        log.warning("本輪來源均正常回應但無新資料（%s）", summary.label())
+    return "ok" if overall == st.IngestStatus.SUCCESS_WITH_DATA.value else overall
 
 
 # --------------------------------------------------------------------------
@@ -364,6 +389,7 @@ def run_forever(name: str = "worker", interval: int = 1800,
             write_heartbeat(
                 status="running" if outcome.ok else "error",
                 last_cycle_ok=outcome.ok,
+                last_cycle_status=_cycle_status(outcome),
                 consecutive_failures=0 if outcome.ok else 1,
                 last_result=outcome.label(),
                 failure_reason="" if outcome.ok else outcome.error,
@@ -377,6 +403,7 @@ def run_forever(name: str = "worker", interval: int = 1800,
             write_heartbeat(
                 status="running" if outcome.ok else "error",
                 last_cycle_ok=outcome.ok,
+                last_cycle_status=_cycle_status(outcome),
                 consecutive_failures=failures,
                 last_result=outcome.label(),
                 failure_reason="" if outcome.ok else outcome.error,
@@ -397,6 +424,14 @@ def run_forever(name: str = "worker", interval: int = 1800,
             lock.release()
         log.info("Worker 已安全停止")
     return 0
+
+
+def _cycle_status(outcome: TaskOutcome) -> str:
+    """取得本輪 ingest 的結構化狀態（供心跳顯示部分失敗）。
+
+    ``run_cycle`` 回傳字串；測試常以替身覆寫，故非字串時回空字串。
+    """
+    return outcome.value if isinstance(outcome.value, str) else ""
 
 
 def _run_cycle_task(attempts: int = 3) -> TaskOutcome:
