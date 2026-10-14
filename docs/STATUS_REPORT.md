@@ -416,3 +416,226 @@ A−B 的 Rank IC 差在 train +0.0006、valid −0.0009 → **符號翻轉、�
 **驗證**：`pytest -q` → **253 passed**（+19）退出碼 0；
 `python -m twstock.ablation`（完整）／`diagnostics --quick`／`cli validate`
 ／`cli --help` 退出碼皆 **0**。
+
+---
+
+# 附錄：第四階段（2026-10-15，P2.7 資料擷取狀態治理）
+
+> 本階段**不修改交易策略、不調整因子權重、不追求回測績效**。
+> 目標只有一個：讓「成功／空結果／部分成功／失敗」可被區分，停止無聲失敗
+> 污染研究結果。所有數字皆來自實測（可重現命令見各節）。
+
+## L. 本階段新發現的缺陷
+
+### D16 — 新聞抓取失敗被記為成功　【嚴重】
+- **位置**：`pipeline.ingest`（舊版）。
+- **事實**：`n_news = sent.update_news_for(...)` 之後直接
+  `store.log_ingest(run_at, sid, "news", ok=True, rows=n_news)`，
+  `ok` 是**硬編碼常數**，與實際結果完全無關。
+  `update_news_for` 在「沒有新聞」與「抓取失敗」都回傳 `0`，故兩者在紀錄上同形。
+- **後果**：新聞抓取失敗在資料層**完全不可見**；健檢與失敗重試都以 `ok` 為依據。
+
+### D17 — feedparser 不拋例外，網路失敗偽裝成「沒有新聞」　【嚴重】
+- **位置**：`news_rss.fetch_google_news`（舊版）直接 `feedparser.parse(url)`。
+- **事實**：feedparser 在網路失敗時**不拋例外**，只設 `bozo` 並回傳空 entries。
+  因此「連不上」、「被限流」與「今天真的沒新聞」三者回應值都是 `[]`。
+- **後果**：上層無法區分；D16 又把 `[]` 記成成功 → **失敗被寫成空結果並標記成功**。
+  相同缺陷重複存在於 `sentiment/experts.py` 的三個來源。
+
+### D18 — 發布時間缺失時以「今天」偽造　【高】
+- **位置**：`news_rss.fetch_google_news`（舊版）
+  `"published": ... if ts else today_str()`。
+- **事實**：取不到來源的 `published_parsed` 時，**以抓取當日的日期代替**。
+  舊版 `experts.py` 三個來源同樣如此。
+- **後果**：舊資料中無法得知哪些 `published` 是來源真實日期、哪些是程式補上的，
+  亦令無法驗證的時間進入情緒衰減窗口。
+
+### D19 — 舊新聞的抓取成敗與時間戳來源不可追溯　【高，**不可修復**】
+- **事實**：現有 237 則新聞全部寫入於狀態治理之前。舊 schema 只有 6 個欄位，
+  既無抓取狀態也無時間戳來源；且因 D18，連「哪些日期是真的」都不可得。
+- **定位**：這是**必須承認的資料損失**，不是可修正的 bug。
+  依任務要求一律標為 `unknown`，**不以推測補造成功狀態**。
+- 可重建的只有分數本身是否存在（`score` 欄位就是直接證據：
+  NULL → `missing`、0 → `neutral`、其餘 → `scored`）。
+
+### D20 — Worker 混同「來源正常但無資料」與「全部失敗」　【中】
+- **位置**：`worker.run_cycle`（舊版）`ok = sum(1 for v in counts.values() if v and v > 0)`。
+- **事實**：只要所有檔的價量列數都是 0 就拋「ingest 全部失敗」——
+  即使資料來源均**正常回應且確實無新資料**；反之，部分失敗也無法從任何欄位看出。
+- **後果**：**無法只依整體退出碼判定所有資料均成功**，這正是任務第 4.4 條禁止的情形。
+
+### D21 — `write_df` 欄位無交集時靜默回 0　【中】
+- **位置**：`store.write_df`（舊版）：`log.warning(...); return 0`。
+- **事實**：有資料但欄位與資料表無交集（或表不存在）時回傳 0，
+  呼叫端看到「0 列」便以 `ok=True` 記下。
+- **後果**：**完全沒有寫入**卻被記錄為成功。現改擧 `WriteRejected`。
+
+### D22 — 測試套件會以可寫模式開啟正式 DB　【中】
+- **發現過程**：本階段新增遷移後，實測發現 `news` 表在未執行任何 `ingest`
+  的情況下於 **2026-10-15T00:11:04** 被遷移（`meta.news_legacy_marked`）。
+- **原因**：`tests/test_ops_worker.py::test_should_run_outside_trading_window`
+  未使用 `temp_db`，卻經由 `worker._should_run` → `store.get_meta` →
+  `store.read_sql` → `_init` 以**可寫模式開啟真實 DB**，
+  即「跑 pytest 就會遷移使用者資料」。
+- **修正**：`tests/conftest.py` 改為 **autouse** 隔離（store DB／DATA_DIR／
+  worker 與 ops 的 STATE_DIR 全部導向 `tmp_path`）。已實測：
+  完整 `pytest` 跑完後真實 DB 的雜湊**不變**。
+
+## M. 資料流與失敗路徑盤點（排程 → 擷取 → 解析 → 驗證 → 寫入 → 狀態 → features）
+
+```
+Worker.run_forever / cli ingest
+  └─ _should_run（休市不轮詢）
+      └─ pipeline.ingest（一輪 = 一個 run_id）
+          ├─ fm.fetch_benchmark/fetch_price   → None=失敗｜空表=成功無資料
+          │     └─ _write_price：clean_prices → _write_with_retry → price 表
+          ├─ _save(fetch_institutional/margin/revenue)
+          ├─ _ingest_corporate_actions → build_corporate_actions → corporate_actions 表
+          ├─ sent.update_news_for → news_rss.fetch_feed → news 表
+          └─ 逐筆寫入 ingest_run（＋保留舊 ingest_log）
+              ↓
+          store.set_meta(last_ingest*／last_ingest_status)
+      └─ run_scores → features.build_features（讀 news 的 published/score）
+                     → signals 表 → worker 心跳（ingest_status/）
+```
+
+**已修正的無聲失敗路徑**（全部位於上述流程，皆有對應測試）：
+
+| # | 路徑 | 修正後行為 |
+|---|---|---|
+| 1 | 新聞狀態硬編碼 `ok=True` | 依 `NewsIngestResult.status` 記錄 |
+| 2 | `feedparser` 吞網路失敗 | `requests` 顯式取得 HTTP → network/timeout/http_status/parse 分類 |
+| 3 | 缺失時間戳補「今天」 | `published=NULL` ＋ `timestamp_source='unknown'`（排除於衰減窗口） |
+| 4 | 失敗與空結果同回 `0` | 回傳結構化結果，四態可分 |
+| 5 | `write_df` 無交集回 0 | 擧 `WriteRejected`；呼叫端記 `failed/write` 並重試 |
+| 6 | Worker 只看列數 | 依 `IngestSummary.overall_status`；部分失敗寫入心跳 |
+| 7 | 舊 `ingest_log` 布林 `ok` | 回填 `ingest_run` 一律 `unknown`（只做一次、冪等） |
+| 8 | 測試寫入真實 DB | autouse 隔離（D22） |
+
+## N. 新增的狀態定義與資料表變更
+
+**狀態（`twstock/data/status.py`）**：`success_with_data`／`success_empty`／
+`partial_success`／`failed`／`skipped`／`unknown`。
+`classify()` 的判定順序即語意保證：任何硬性錯誤分類
+（network／timeout／http_status／parse／validation／write）一律得到 `failed`，
+**永不會落成 `success_empty`**。
+
+**錯誤分類**：`none`／`network`／`timeout`／`http_status`／`parse`／
+`validation`／`write`／`empty`／`unknown`。
+
+**新表 `ingest_run`**（主鍵 `run_id, dataset, stock_id`）：`run_id`／`dataset`／
+`stock_id`／`run_at`／`source`／`task`／`started_at`／`ended_at`／`status`／
+`error_class`／`error`／`rows_fetched`／`rows_parsed`／`rows_validated`／
+`rows_written`／`data_start`／`data_end`／`attempts`／`source_version`／
+`config_id`／`provenance`／`notes`。
+來源版本（新聞）為情緒規則的詞表指紋，設定識別為股票池與回溯年數的短雜湊，
+**皆不含機密**；所有錯誤訊息寫入前經 `status.redact` 遮蔽 token／api_key／Bearer 等。
+
+**`news` 表新增 5 欄**：`published_at`／`fetched_at`／`timestamp_source`／
+`score_kind`／`provenance`（CREATE 與 ALTER 兩路皆覆蓋，向後相容）。
+
+## O. 修復前後差異（真實本機 DB，於副本上量測）
+
+| 指標 | 修復前 | 修復後 |
+|---|---|---|
+| `news` 欄位數 | 6 | 11 |
+| 可判定**抓取成敗**的列 | **0** | 237（全部 = `unknown`） |
+| 可判定**時間戳來源**的列 | **0** | 237（全部 `unknown`） |
+| 新聞列數／正·零·負分數 | 237／16·183·38 | 237／16·183·38（不變） |
+| `published` NULL | 0 | 0 |
+| 特徵面板列數／`sha` | 9,719／`c0fa6357e4af` | **完全相同** |
+| `signals` 表 `sha` | `ebfb28c2618c` | **完全相同** |
+| 面板 `news_present=1`／覆蓋率 | 61／0.628% | 61／**0.628%（不變）** |
+| `ingest_log` 失敗筆數 | **0**（163 筆全為 `ok=1`，含 news 20/20） | 回填後 163 筆全為 `unknown` |
+
+**這張表最重要的兩列**：特徵面板與訊號表**逐位元不變** →
+schema 變更沒有造成非預期差異（任務 6.3）；新聞覆蓋率**不變** →
+狀態治理**沒有、也不應該**提升預測能力（任務 6.4）。
+真正改變的只有「可信度」：修復前對抓取成敗與時間戳來源的可判定性**都是 0**。
+
+## P. 新聞資料覆蓋率與品質統計
+
+`python -m twstock.cli datacheck`（實測輸出）：
+
+| 項目 | 值 |
+|---|---|
+| 新聞列數 | 237（可追溯 0、不可追溯 **237**） |
+| 發布時間可追溯 | 0（時間不明 237） |
+| 有效情緒分數（scored） | 54 |
+| 情緒中性（neutral） | 183 |
+| 無情緒分數（missing） | 0 |
+| 有效情緒覆蓋率 | 全部列 **22.8%**／可追溯列 **無資料** |
+| 不可追溯率 | **100.0%** |
+| 新聞抓取成功率／失敗率 | **無可判定紀錄**（20 筆狀態全為 `unknown`） |
+| 涵蓋日期 | —（因無法確認哪些 `published` 為真） |
+
+**如何解讀**：這不是「修復後變差」，而是**修復前根本沒有這些數字**。
+過去唯一的成敗依據 `ingest_log` 顯示 163 筆全部成功、0 筆失敗，
+但其中新聞的 `ok` 是硬編碼常數（D16），因此那份「完美紀錄」不可採信。
+本階段選擇**如實承認不知道**，而不是繼續用一個假的成功率。
+
+## Q. 資料遷移風險及無法追溯的舊資料
+
+- **已發生的遷移**：本機 `twstock/data_store/twstock_v3.db` 已於
+  **2026-10-15T00:11:04** 被遷移（原因為 D22，已修正）。遷移是**純新增**：
+  補 5 個欄位、新建 `ingest_run`、把 `news.provenance`／`timestamp_source`
+  設為 `unknown`、回填 163 筆舊紀錄為 `unknown`。
+  **已驗證 `price`／`news` 分數／`signals` 內容與特徵面板逐位元不變**，
+  且沒有任何列被覆寫或刪除。
+- **遷移幂等性**：`_mark_legacy_news` 與 `_backfill_ingest_run` 均以 `meta` 鍵守門
+  （`news_legacy_marked`、`ingest_run_backfilled`），且 `UPDATE` 只碰 `NULL` 列，
+  重複執行不新增也不覆寫（有測試）。
+- **不可追溯的資料（明確標記，不補猜）**：
+  - 237 則新聞的**抓取成敗**：不可重建（舊 schema 無此資訊 + D16）。
+  - 237 則新聞的**時間戳來源**：不可重建（因 D18 曾以「今天」偽造）。
+  - 163 筆舊擷取紀錄的**成功有資料／成功無資料**：不可區分（舊 `ok` 只有布林）。
+- **風險**：若日後有新程式讀 `news.published` 而未檢查 `timestamp_source`，
+  會把「可能是偽造的日期」當成真日期。已在 `README.md` 與 `DATA_SOURCES.md`
+  明文警告。
+
+## R. 測試案例、退出碼與 CLI 驗證
+
+新增 `tests/test_ingest_governance.py`（**43 項**，全部合成資料、**不連外**）：
+
+| 任務要求 | 對應測試 |
+|---|---|
+| 正常取得資料 | `test_feed_success_with_data`、`test_scored_news_has_valid_sentiment` |
+| 正常回應但無資料 | `test_feed_normal_response_without_entries_is_empty_not_failed`、`test_news_empty_result_status_is_success_empty` |
+| 網路失敗與逾時 | `test_feed_network_failure_is_failed_not_empty`、`test_feed_timeout_is_failed_timeout`、`test_news_fetch_failure_is_recorded_as_failed` |
+| HTTP 成功但解析失敗 | `test_http_200_but_unparseable_body_is_parse_failure`、`test_http_error_status_is_classified` |
+| 部分資料成功、部分失敗 | `test_ingest_summary_partial_success_overall`、`test_worker_partial_failure_is_visible_not_full_success` |
+| 寫入失敗及重試 | `test_write_retries_then_succeeds`、`test_write_failure_after_retries_is_failed_write`、`test_write_df_rejects_no_intersecting_columns` |
+| 重複執行與幂等性 | `test_news_write_is_idempotent`、`test_ingest_run_records_do_not_duplicate_on_rerun` |
+| 舊資料與 unknown | `test_legacy_ingest_log_backfilled_as_unknown`、`test_legacy_news_marked_untraceable_but_score_kind_derived`、`test_legacy_rows_not_counted_as_fetch_success`、`test_unknown_status_is_not_a_claimed_success` |
+| 新聞中性／缺值／無新聞／失敗 | `test_neutral_news_distinguished_from_no_news`、`test_missing_timestamp_is_not_fabricated`、`test_failed_fetch_writes_nothing_and_is_distinguishable` |
+| 未來新聞不得外洩 | `test_future_dated_news_is_not_stored`、`test_news_never_affects_dates_before_publication`、`test_unknown_timestamp_news_is_excluded_from_signals` |
+| 失敗不得被 worker 記為成功 | `test_worker_raises_when_every_dataset_failed`、`test_worker_accepts_normal_empty_source_as_not_failure`、`test_worker_reports_success_with_data_as_ok`、`test_ingest_summary_all_failed_only_when_everything_failed` |
+| 機密不寫入 | `test_secrets_are_redacted_in_records` |
+| 「失敗不得降級成空結果」 | `test_hard_failure_never_classified_as_success_empty`（參數化 6 種錯誤分類） |
+
+| 命令 | 結果 | 退出碼 |
+|---|---|---:|
+| `python -m pytest -q` | **296 passed**（上階段 253，+43） | **0** |
+| `python -m twstock.cli datacheck` | 產出資料品質報告 | **0** |
+| `python -m twstock.cli validate` | 既有驗證未受影響 | **0** |
+| `python -m twstock.cli health` | 顯示擷取狀態（新增） | **0** |
+| `python -m twstock.cli status` | — | **0** |
+| `python -m twstock.cli --help` | 列出 `datacheck` | **0** |
+
+**每個 commit 皆獨立驗證**：在 detached worktree 檢出各 commit 的完整快照執行 `pytest`
+（commit 1 → 253 passed、commit 2 → 253 passed 且無警告、commit 3 → 296 passed）。
+
+## S. 本階段仍然未解決的問題
+
+1. **新聞的抓取成敗永遠不可追溯**（D19）：237 則全部 `unknown`，不可重建。
+2. **RSS 無法回溯歷史**：只能取得「最近 `days` 日」，因此新聞因子的跨期評估
+   先天受限；在按日累積寫入並長期保存（或改用付費歷史新聞源）之前，
+   重評 B17 仍然沒有可信的分母。
+3. **公開 RSS 無 SLA、無備援來源**（失敗現已可觀測，但沒有第二來源交叉驗證）。
+4. **未驗證真實網路失敗情境**：測試全部以注入的假 getter 驅動（**刻意如此**，
+   任務要求測試不得依賴真實網路）。因此 `requests` 與 Google News 的實際
+   互動行為（如限流回應）**未在本階段實測**——不得宣稱已驗證。
+5. **worker 的部分失敗僅止於「可見」**：心跳會顯示 `partial_success`，
+   但尚未依失敗來源自動重試或分流。
+6. **未修改交易策略、曝險上限或持有期間；未調因子權重；未安裝 ML 套件；
+   未開設正式交易；不宣稱新聞因子或整體策略具備可交易優勢。**

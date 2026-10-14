@@ -29,6 +29,7 @@ python -m twstock.cli ingest      :: 抓日K／法人／融資券／月營收／
 python -m twstock.cli run         :: 特徵 + 規則打分（+ 可選 ML）
 python -m twstock.cli backtest    :: 回測（含交易成本與基準比較）
 python -m twstock.cli validate    :: 樣本外驗證 + 成本敏感度（產出完整報告）
+python -m twstock.cli datacheck   :: 資料擷取狀態 + 新聞品質（不連網、不改資料）
 python -m twstock.cli notify      :: Telegram 通知（可選）
 ```
 
@@ -83,6 +84,27 @@ C 固定權重 / D 可用性閘門）加一個分解控制組 A\*，並驗證**�
 **結論：不修改正式策略**（86 個配對假設校正後無一顯著，test 段成交完全相同）。
 完整結果見 `docs/ABLATION_B17.md`，逐行輸出於 `twstock/reports/ablation_*.txt`。
 
+### 資料品質與擷取狀態（這批資料可不可信？）
+
+```bat
+python -m twstock.cli datacheck      :: 新聞筆數／情緒覆蓋率／抓取成功率與失敗率
+python -m twstock.cli health         :: 含最近一輪各資料集的擷取狀態
+```
+
+每次擷取都會留下**結構化狀態**（`ingest_run` 資料表），明確區分六種結果：
+`success_with_data`（成功且有資料）、`success_empty`（來源正常但確實沒資料）、
+`partial_success`、`failed`、`skipped`、`unknown`（舊資料不可追溯）。
+**失敗不會被降級成「沒有資料」**；記錄含來源、任務、起訖時間、可重現的錯誤分類、
+取得／解析／驗證／寫入筆數、資料涵蓋日期範圍、重試次數與來源版本／設定識別，
+且寫入前一律遮蔽 API 金鑰與密碼。
+
+新聞另外區分四態：**沒有新聞**、**有新聞但情緒中性**、**有有效情緒分數**、
+**抓取失敗**；發布時間取不到時記為 NULL（不以「今天」代替），
+情緒規則版本以指紋記錄，使跨版本的分数混用可被稽核。
+
+> ⚠️ 本機現有 237 則新聞全部寫在狀態治理之前，當時**是否抓取成功無從判定**，
+> 已一律標為 `unknown`（不可追溯）。分數欄位本身可觀察，但不得視為抓取成功。
+
 ### 服務生命週期
 
 ```bat
@@ -115,19 +137,22 @@ twstock/
   data/
     finmind_client.py  # FinMind API v4（失敗回 None，與「空資料」區分）
     store.py           # SQLite：INSERT OR REPLACE 冪等寫入，永不 DROP 表
+    status.py          # 擷取狀態詞彙、錯誤分類、紀錄結構與機密遮蔽
+    report.py          # 資料品質報告：新聞覆蓋率、抓取成功率／失敗率、狀態分佈
     quality.py         # 無效價格清理、除權息／分割還原與驗證守門
     loader.py          # 價格載入（清理 + 還原，策略與基準一致）
-  sentiment/           # Google News RSS + 規則式情緒；專家觀點來源
+  sentiment/           # Google News RSS + 規則式情緒；專家觀點來源（共用狀態化取得）
   features.py          # 技術指標（RSI/KD/MACD/布林/K線型態）+ 籌碼 + 營收 + 情緒
   signals.py           # 規則式多因子打分 + 尺度無關的訊號融合
   ml_model.py          # LightGBM walk-forward（可選，未安裝時明確停用）
   backtest.py          # T+1 開盤成交、成本模型、週轉率指標、0050 基準
-  pipeline.py          # 每日流程 + 失敗追蹤（ingest_log）
+  pipeline.py          # 每日流程 + 結構化擷取狀態（ingest_run，另保留 ingest_log）
   worker.py            # 監控 Worker（單一實例鎖、重試、逾時、健康狀態機）
-  ops.py               # start / stop / status / health
+  ops.py               # start / stop / status / health（含擷取狀態）
   app.py               # FastAPI 本地儀表板
   cli.py               # CLI 唯一進入點
-tests/                 # pytest：功能、資料品質、時間正確性、成本、驗證、Worker
+tests/                 # pytest：功能、資料品質、時間正確性、成本、驗證、Worker、
+                       #        擷取狀態治理（autouse 隔離，不會寫入真實 DB）
 plan.md                # 工程計畫與進度（活的文件）
 docs/STATUS_REPORT.md  # 專案現況盤點報告
 ```
@@ -152,13 +177,24 @@ docs/STATUS_REPORT.md  # 專案現況盤點報告
 |---|---|---|---|
 | FinMind API v4 | 日K、法人、融資券、月營收、0050 基準 | 盤後 | 免費版限流；`FINMIND_TOKEN` 可選 |
 | FinMind（公司行動） | 分割／減資（`TaiwanStockSplitPrice`）、股利（`TaiwanStockDividend`） | 事件發生時 | 免費層可用；`TaiwanStockPriceAdj` 還原股價為付費層 |
-| Google News RSS | 個股新聞 | 每次 ingest | 公開 RSS，非正式 API |
+| Google News RSS | 個股新聞 | 每次 ingest | 公開 RSS，非正式 API；僅涵蓋最近 `days` 日 |
 | YouTube RSS / Google News | 專家觀點 | 手動 | 公開 RSS |
 
 **行情為延遲/收盤後資料，並非即時行情**。儀表板一律顯示「最新行情日期」與延遲天數。
 
 缺值／失敗處理原則：抓取失敗一律記為失敗（不回填 0），資料不足時標記「無法判斷」，
 不產生看似正常的訊號。
+
+**新聞資料的可追溯性限制（實測）**：本機既有 237 則新聞（2026-10-06 ~ 2026-10-13，
+影響面板 61/9,719 列 ≈ 0.63%）全部寫在狀態治理之前，且舊程式在發布時間取不到時
+會以**當天日期**代替，因此：
+
+- 無法判定任何一則當時是否真的抓取成功 → 全部標為 `unknown`；
+- 無法分辨哪些日期是來源真實發布日、哪些是程式補上的日期 → `timestamp_source` 全部 `unknown`；
+- 舊系統的抓取紀錄（`ingest_log`）163 筆**全部 `ok=1`**，其中新聞 20/20 全為成功，
+  但那是舊程式硬編碼的結果，**不能當成證據**。
+
+因此新聞因子的任何評估都必須先聲明此限制；本階段**不宣稱**新聞因子具備預測能力。
 
 ---
 
@@ -180,7 +216,12 @@ python -m pytest -q
 ```
 
 涵蓋：特徵計算、規則打分、情緒、寫入冪等（不覆蓋其他標的）、ingest 失敗處理、
-ML 標籤、訊號融合尺度、回測時間正確性、風險限制與 Kill Switch。
+ML 標籤、訊號融合尺度、回測時間正確性、風險限制與 Kill Switch，
+以及擷取狀態治理（六態區分、新聞四態、未來新聞不外洩、舊資料不可追溯、
+Worker 不得把失敗記成完整成功）。目前 **296 項**。
+
+測試一律將儲存層隔離到暫存 DB（`tests/conftest.py` 的 autouse 夾具），
+**不會**寫入或遷移 `twstock/data_store/` 的真實資料。
 
 ---
 

@@ -127,6 +127,10 @@ Windows 一鍵包裝：`run.bat`。安全停止會寫入 `data_store/state/*.sto
 - 技術/價量特徵：以當日**收盤後**才算得，訊號僅能在**次一交易日**執行（回測亦同）。
 - 月營收：以**實際公告日**為可用時間，不用「資料所屬月份」（目前以 `date` 欄位為公告日）。
 - 新聞情緒：以發佈日 + 3 日衰減權重（1.0 / 0.66 / 0.4）。
+  **P2.7 起**：發布時間必須來自來源（`timestamp_source='source'`）；取不到時
+  `published` 記為 NULL 並排除於衰減窗口（**不得**以抓取日代替，否則等於憑空
+  生成時間戳）。來源時間晚於抓取時間者亦不採用。風散方向只往未來（lag ≥ 0），
+  故發布日之前的交易日不會看到該新聞。
 
 ### 5.4 回測時間正確性（已修正）
 
@@ -197,12 +201,26 @@ Kill Switch 只「禁止新增正式委託」，**不刪除交易紀錄、不自
 
 ---
 
+### 5.7 擷取狀態與資料可追溯性（P2.7）
+
+每次擷取寫入 `ingest_run`，區分六種狀態：`success_with_data`、`success_empty`、
+`partial_success`、`failed`、`skipped`、`unknown`。
+
+- **失敗不得降級成空結果**：`status.classify` 的判定順序讓任何硬性錯誤分類
+  （network／timeout／http_status／parse／validation／write）一律得到 `failed`。
+- **「來源正常但沒有資料」不是失敗**：舊 `worker.run_cycle` 以「價量列數 > 0」
+  判定整輪成敗，會把這種情況誤判為失敗，反之亦無法看出部分失敗。
+- **不可追溯就標 `unknown`**：舊資料或非結構化回傳絕不補猜成功。
+- 紀錄不含任何 API 金鑰；所有錯誤訊息寫入前經 `status.redact`。
+
+---
+
 ## 7. 各階段開發計畫（P0 → P8）
 
 | 階段 | 內容 | 完成條件 | 狀態 |
 |---|---|---|---|
 | **P0** | 現況盤點（程式/資料/模型/回測/Git） | 產出 `docs/STATUS_REPORT.md` 並標明證據 | `VERIFIED` |
-| **P1** | 資料品質與基礎架構（覆蓋、時間戳、重跑、錯誤處理） | 新聞不再互相覆蓋、ingest 失敗不得記為成功、寫入可重跑 | `DONE`（見 §8） |
+| **P1** | 資料品質與基礎架構（覆蓋、時間戳、重跑、錯誤處理） | 新聞不再互相覆蓋、ingest 失敗不得記為成功、寫入可重跑 | `VERIFIED`（W3／W4；擷取狀態治理於 P2.7／W23 完成） |
 | **P2** | 策略與回測可信度 | 無 look-ahead、成本模型合理、有基準比較、可重現 | `VERIFIED`（P2.1 樣本外 + P2.2 成本已驗證） |
 | **P3** | 本地監控 Worker | 可持續執行、可觀測、可重啟恢復 | `VERIFIED`（P3.1 硬化完成） |
 | **P4** | 風險控制與模擬券商 | 風控、委託狀態機、持倉同步、冪等、Kill Switch | `TODO` |
@@ -410,6 +428,44 @@ Kill Switch 只「禁止新增正式委託」，**不刪除交易紀錄、不自
 - **新增欄位**：`features.build_features` 新增 `news_present`（僅在有新聞分支加入，
   **向後相容**），使「有記錄 / 情緒 0 / 缺值」三態可分。
 
+### W23 — P2.7 資料擷取狀態治理與新聞資料品質修復 ✅ `VERIFIED`
+- **背景**：本階段**不修改策略、不調因子權重、不追求績效**；目標是讓「成功／
+  空結果／部分成功／失敗」在被區分，停止無聲失敗污染研究結果。
+- **盤點出 6 條失敗路徑**（全部都有程式碼位置，非推測）：
+  1. `pipeline.ingest` 對新聞硬編碼 `log_ingest(..., ok=True)` → 抓取失敗記為成功。
+  2. `news_rss` 直接呼叫 `feedparser.parse(url)`；feedparser 在網路失敗時**不拋例外**，
+     只設 `bozo` 並回傳空 entries → 失敗偽裝成「沒新聞」。
+  3. 發布時間取不到時以 `today_str()` 代替 → 憑空生成日期。
+  4. `sentiment.update_news_for` 在「沒有新聞」與「抓取失敗」都回 `0` → 四態塌縮成兩態。
+  5. `store.write_df` 在欄位無交集時只寫 log 並回 `0`，呼叫端仍記 `ok=True`。
+  6. `worker.run_cycle` 只數 `counts > 0` → 混同「來源正常但無資料」與「全部失敗」。
+- **解方**：新增 `data/status.py`（狀態詞彙、錯誤分類、`IngestRecord`、機密遮蔽）、
+  `data/report.py`（資料品質報告）、`ingest_run` 資料表、`cli datacheck`；
+  `news` 表新增 5 個溯源欄位；新聞改用 `requests` 顯式取得 HTTP 後才解析。
+- **量測（真實本機 DB，於副本上比較）**：
+
+  | 指標 | 修復前 | 修復後 |
+  |---|---|---|
+  | `news` 欄位數 | 6 | 11 |
+  | 可判定**抓取成敗**的列 | **0** | 237（但全部 = `unknown`） |
+  | 可判定**時間戳來源**的列 | **0** | 237（全部 `unknown`） |
+  | 新聞列數／正·零·負分數 | 237／16·183·38 | 237／16·183·38 |
+  | 特徵面板列數與 `sha` | 9,719／`c0fa6357e4af` | **完全相同** |
+  | `signals` 表 `sha` | `ebfb28c2618c` | **完全相同** |
+  | 面板新聞覆蓋率 | 0.628% | **0.628%**（不變） |
+
+- **關鍵結論**：**特徵與訊號逐位元不變**→ schema 變更沒有造成非預期差異，
+  也沒有、也不該提升任何預測能力。真正改變的是「**可信度**」：
+  修復前對抓取成敗與時間戳來源的可判定性都是 **0**。
+- **無聲失敗的直接證據**：`ingest_log` 163 筆**全部 `ok=1`**（其中新聞 20/20 皆為成功），
+  這是舊程式硬編碼的結果而非證據 → 回填 `ingest_run` 時**一律標為 `unknown`**。
+- **驗證**：`pytest -q` → **296 passed**（上階段 253，+43 新增檔）；
+  `cli datacheck`／`validate`／`health`／`status`／`--help` 退出碼皆為 **0**。
+- **額外修正（本階段發現）**：測試套件原本會以可寫模式開啟**正式 DB**
+  （`test_should_run_outside_trading_window` 未使用 `temp_db`）→ 執行 `pytest`
+  就會對使用者資料觸發遷移（實測時間戳 `2026-10-15T00:11:04`）。
+  已改為 autouse 隔離，並實測確認跑完 `pytest` 後真實 DB 雜湊**不變**。
+
 ## 9. 測試方式及驗證結果
 
 ```bat
@@ -435,8 +491,11 @@ python -m pytest -q
 | `tests/test_costs_turnover.py` | 成本模型、週轉率公式、成本單調性、換手變體（W14/W15） |
 | `tests/test_worker_hardening.py` | 鎖、重試、逾時、健康狀態、生命週期（W16） |
 | `tests/test_ops_lifecycle.py` | 停止語意與狀態清理（W16） |
+| `tests/test_ingest_governance.py` | 擷取狀態治理：六態區分、新聞四態、網路／逾時／解析失敗、
+  部分成功、寫入重試、幂等性、舊資料 `unknown`、未來新聞不外洩、時間不明
+  不得進訊號、Worker 不得把失敗記成完整成功、機密遮蔽（W23，43 項） |
 
-**現況**：P0 基準 `14 passed` → 首輪修復後 **`55 passed`**（新增 41 項回歸測試）。
+**現況**：P0 基準 `14 passed` → 首輪修復後 **`55 passed`** → P2.7 後 **`296 passed`**。
 
 實際執行項目與結果：
 
@@ -475,6 +534,13 @@ python -m pytest -q
 | B18 | **訊號在樣本外不穩定**：`score` 的 IC 由 train +0.1170（p=0.0010）退到 valid +0.0502（p=0.30）、test −0.0104（p=0.74） | 高 | 已實測（W17）；目前證據不支持投入調參 |
 | B19 | Worker 逾時仍**無法中止**已執行的任務；子程序原型已備但**尚未接進** `worker.run_forever` | 中 | 原型 `VERIFIED`（W20）；接線 `TODO` |
 | B20 | 沒有 CI：測試、驗證與診斷報告均靠手動執行，缺乏回歸防護 | 中 | `TODO` |
+| B21 | **歷史新聞的抓取成敗不可追溯**：237 則全部寫在狀態治理之前，且舊程式會用「今天」
+偽造缺失的發布時間 → 無法分辨哪些日期是真的 | 高 | 已標為 `unknown`（W23）；**不可重建**，需靠新增的跨期資料重建可信歷史 |
+| B22 | **新聞來源為公開 RSS（非正式 API）**：無 SLA、可能變更格式或封鎖；
+現已可區分失敗（parse／http_status），但仍無備援來源 | 中 | `TODO`（`DATA_SOURCES.md` 列有交叉驗證來源） |
+| B23 | 僅能取得「最近 `days` 日」的新聞，**無法回溯歷史**（RSS 特性）→ 新聞因子的
+跨期評估先天受限 | 高 | `TODO`（需改為按日累積寫入並長期保存，或改用付費歷史新聞源） |
+| B24 | `signals.py` 的 `WEIGHTS` 註解寫「總和 = 1.0」，實測總和為 **1.05** | 低 | `TODO`（註解錯誤，不影響分數） |
 
 ---
 
@@ -494,7 +560,8 @@ python -m pytest -q
 
 - `python -m pytest -q` → 全部通過（見 §9 / §11）。
 - 本地儀表板可啟動並回應 `GET /` 200（`http://127.0.0.1:8000`）。
-- 見文末「最後驗證（P2.6）」。
+- 見文末「最後驗證（P2.7）」。
+- `python -m twstock.cli datacheck` → 退出碼 0（新增；只描述資料可信度）。
 
 ---
 
@@ -516,20 +583,79 @@ python -m pytest -q
 6. **P4**：模擬券商 + 委託狀態機（`risk.py` 已有檢查層）——但**只有在訊號
    真的有樣本外優勢時才值得做**，否則只是把一個沒有優勢的策略自動化。
 7. **B1 決策**：是否安裝 `lightgbm`/`scikit-learn`（需使用者決定）。
-8. **小修（低優先）**：`signals.py` 的 `WEIGHTS` 註解寫「總和 = 1.0」，
+8. **B21/B23 新聞可追溯性（本階段新增，優先於 B17 重評）**：現有 237 則新聞
+   的抓取成敗與時間戳來源**全部不可判定**，且 RSS 無法回溯歷史。
+   在評估任何新聞因子之前，必須先**按日累積寫入並長期保存**（或取得付費歷史新聞源），
+   否則重評 B17 仍然沒有可信的分母。這比調權重重要。
+9. **B22 備援新聞來源**：公開 RSS 無 SLA；失敗現在可觀測，但沒有第二來源可交叉驗證。
+10. **小修（低優先）**：`signals.py` 的 `WEIGHTS` 註解寫「總和 = 1.0」，
    實測總和為 **1.05**（不影響分數，因會再標準化，但註解錯誤）。
 
 ---
 
-## 本輪 commit（P2.6，2026-10-14，已 push 至 `origin/main`）
+## 本輪 commit（P2.7，2026-10-15，已 push 至 `origin/main`）
 
-起始 HEAD = `293c34d`；結束 HEAD 見文末。無 force push、未覆蓋任何未提交修改。
+起始 HEAD = `47fcec8`；結束 HEAD 見文末。無 force push、未覆蓋任何未提交修改。
+
+| 順序 | SHA | 訊息 | 內容 |
+|---|---|---|---|
+| 1 | `7cd9f3c` | `feat(data): 擷取狀態治理，讓失敗不再降級成「沒有資料」` | data/status.py、data/report.py、store.py（`ingest_run`＋news 溯源欄位＋`WriteRejected`）、`conftest.py`（autouse 隔離） |
+| 2 | `c08721c` | `fix(sentiment): 新聞抓取失敗不再偽裝成沒有新聞，時間戳不臆測` | news_rss.py（`fetch_feed`）、sentiment.py、experts.py、pipeline.py |
+| 3 | `de6b82b` | `fix(worker): 依結構化狀態判定成敗，並新增資料品質檢查指令` | worker.py、ops.py、cli.py（`datacheck`）、`test_ingest_governance.py`（43） |
+| 4 | （本 commit） | `docs: 記錄 P2.7 擷取狀態治理結果、資料品質統計與技術債` | README.md、plan.md、STATUS_REPORT.md、DATA_SOURCES.md |
+
+**每個 commit 皆在 detached worktree 檢出完整快照獨立驗證過**（非只在最終狀態跑一次）：
+
+| commit | 驗證 | 結果 |
+|---|---|---|
+| `7cd9f3c` | worktree 檢出該快照後 `pytest -q` | **253 passed**（退出碼 0） |
+| `c08721c` | 同上 | **253 passed**（退出碼 0，且無 SyntaxWarning） |
+| `de6b82b` | 同上 | **296 passed**（退出碼 0） |
+
+第 2 個 commit 因 `experts.py` 改了回傳型態，其呼叫端 `pipeline.ingest_experts`
+必須同一個 commit 落地（否則該快照的 `ingest_experts` 會拋 `ValueError`）——
+這是實際驗證時發現的問題，因此調整了切分方式而非默認它能獨立運作。
+
+## 最後驗證（P2.7，2026-10-15）
+
+| 命令 | 結果 | 退出碼 |
+|---|---|---:|
+| `python -m pytest -q` | **296 passed**（上階段 253，本階段 +43） | **0** |
+| `python -m twstock.cli datacheck` | 新聞覆蓋率、抓取成功率／失敗率、狀態分佈 | **0** |
+| `python -m twstock.cli validate` | 既有驗證未受影響 | **0** |
+| `python -m twstock.cli health` | 新增顯示最近一輪各資料集擷取狀態 | **0** |
+| `python -m twstock.cli status` | — | **0** |
+| `python -m twstock.cli --help` | 列出 `datacheck` | **0** |
+| `python -m compileall -q -f twstock tests` | 全部編譯成功、**無 SyntaxWarning** | **0** |
+| 真實 DB 雜湊（跑完完整 `pytest` 前後） | **不變**（`md5 e4970d6f…`） | — |
+
+**研究影響檢查（任務第 6 節，實測而非推論）**：
+
+1. **既有 features 與 signals 沒有非預期差異**：在真實本機 DB 的副本上比較
+   「遷移前 vs 遷移後」，特徵面板（9,719 列）與 `signals`（9,720 列）的
+   `sha256` 前 12 碼**完全相同**（`c0fa6357e4af`／`ebfb28c2618c`）。
+2. **新聞有效覆蓋率不變**：`news_present=1` 皆為 61 列／**0.628%**。
+   狀態治理**沒有**、也不應該提升預測能力。
+3. **不重複使用已消耗的 test 段**：本階段未執行任何回測、未重跑 `validate` 的
+   test 段結論、未宣稱任何新的樣本外優勢（僅確認既有報告仍可重現）。
+4. **不可判定者一律標 `unknown`**：237 則新聞、163 筆舊擷取紀錄全部如實標示，
+   不補造成功狀態。
+
+**本階段結論（一句話）**：修復後**策略與訊號完全沒變**；變的是
+「我們現在知道哪些資料可信、哪些不知道」而已——而過去連「不知道」都看不出來。
+
+---
+
+## 上一輪 commit（P2.6，2026-10-14，已 push 至 `origin/main`）
+
+起始 HEAD = `293c34d`；結束 HEAD = `origin/main` = `47fcec8`。無 force push。
 
 | 順序 | SHA | 訊息 | 內容 |
 |---|---|---|---|
 | 1 | `e8b97b1` | `feat(quant): B17 新聞因子消融驗證，分離分子與分母效應` | ablation.py、features.py（+`news_present`）、`test_ablation.py`（19） |
 | 2 | `107cabc` | `docs: 記錄 P2.6 消融結果，修正 B17 的量化描述與處置` | ABLATION_B17.md、STATUS_REPORT.md、plan.md |
-| 3 | （本 commit） | `docs(plan): 補上本輪 commit 表與最終驗證紀錄` | plan.md |
+| 3 | `8d40939` | `docs(plan): 補上本輪 commit 表與最終驗證紀錄` | plan.md |
+| 4 | `47fcec8` | `docs: 同步 P2.6 結論至 README 與資料來源方案` | README.md、DATA_SOURCES.md |
 
 每個 commit 皆為可獨立驗證的工作單位：`features.py` 的 `news_present` 為**純新增**
 （預設行為不變，既有測試不變即通過），方案實作與測試同單位落地。
