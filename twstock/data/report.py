@@ -27,6 +27,11 @@ NEWS_DATASET = st.DATASET_NEWS
 
 REPORT_TITLE = "資料擷取與新聞品質報告"
 
+# 每日明細最多列幾日（避免舊資料過長時淹沒真正重要的摘要）
+MAX_DAILY_ROWS = 31
+
+UNDATED_LABEL = "(時間不明)"
+
 
 # --------------------------------------------------------------------------
 # 抓取狀態（來自 ingest_run）
@@ -200,6 +205,41 @@ def news_coverage() -> NewsCoverage:
 # --------------------------------------------------------------------------
 # 完整報告
 # --------------------------------------------------------------------------
+def daily_news_counts(cov: NewsCoverage | None = None) -> pd.DataFrame:
+    """每日新聞筆數（最近優先），含情緒型態與「時間不明」分桶。
+
+    任務要求報告需明確顯示每日新聞筆數；此函式是唯一來源，
+    報表與程式取用同一份分母，避免兩處算法不一致。
+    """
+    df = (cov or news_coverage()).per_day
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "rows", "scored", "neutral",
+                                     "missing_score", "unknown_timestamp"])
+    dated = df[df["date"] != UNDATED_LABEL].sort_values("date", ascending=False)
+    undated = df[df["date"] == UNDATED_LABEL]
+    return pd.concat([dated, undated], ignore_index=True)
+
+
+def _daily_table_lines(cov: NewsCoverage) -> list[str]:
+    """每日新聞筆數段落（以直線分隔，不假裝 CJK 能精確對齊）。"""
+    rows = daily_news_counts(cov)
+    if rows.empty:
+        return ["  每日新聞筆數：無資料"]
+    out = ["  每日新聞筆數（最近優先；只列狀態可觀察的欄位）",
+           "    日期 | 筆數 | 有分數 | 中性 | 無分數 | 時間不明"]
+    dated = rows[rows["date"] != UNDATED_LABEL]
+    undated = rows[rows["date"] == UNDATED_LABEL]
+    for r in dated.head(MAX_DAILY_ROWS).itertuples(index=False):
+        out.append(f"    {r.date} | {r.rows} | {r.scored} | {r.neutral} "
+                   f"| {r.missing_score} | {r.unknown_timestamp}")
+    if len(dated) > MAX_DAILY_ROWS:
+        out.append(f"    …（另有 {len(dated) - MAX_DAILY_ROWS} 日未列出）")
+    for r in undated.itertuples(index=False):
+        out.append(f"    {UNDATED_LABEL} | {r.rows} | {r.scored} | {r.neutral} "
+                   f"| {r.missing_score} | {r.unknown_timestamp}")
+    return out
+
+
 def build_report_text(run_id: str | None = None) -> str:
     """組合人類可讀的資料品質報告（供 CLI 與文件引用）。"""
     cov = news_coverage()
@@ -211,6 +251,8 @@ def build_report_text(run_id: str | None = None) -> str:
              "",
              "── 新聞資料品質 ──",
              cov.to_text(),
+             "",
+             *_daily_table_lines(cov),
              "",
              "── 新聞抓取狀態（依 ingest_run） ──",
              f"  紀錄數                {rates['n_records']}"

@@ -332,9 +332,12 @@ def run_cycle(force: bool = False) -> str:
 
     log.info("開始資料更新（%s）", why)
     summary = ingest()
-    if summary.all_failed:
-        log.error("本輪所有擷取皆失敗（%s），保留原有資料與時間戳", summary.label())
-        raise RuntimeError(f"ingest 全部失敗：{summary.label()}")
+    if summary.root_all_failed():
+        # 價量（根資料集）全數失敗：即使新聞或籌碼有成功也不得繼續打分，
+        # 否則會用陳舊價格產生看似正常的訊號。
+        log.error("本輪價量擷取全數失敗（%s），保留原有資料與時間戳",
+                  summary.label())
+        raise RuntimeError(f"ingest 價量全數失敗：{summary.label()}")
 
     # 讓部分失敗可從可觀測狀態辨識，而不是只看退出碼
     write_heartbeat(

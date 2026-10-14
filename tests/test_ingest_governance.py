@@ -190,24 +190,26 @@ def test_ingest_summary_partial_success_overall():
     s = st.IngestSummary(run_id="R", statuses={"2330": "success_with_data",
                                                "2317": "failed"}, records=recs)
     assert s.overall_status == st.IngestStatus.PARTIAL_SUCCESS.value
-    assert s.all_failed is False
+    # 根資料集（價量）未全數失敗 → 不算整輪失敗
+    assert s.root_all_failed() is False
     assert s.failed_count == 1 and s.usable_count == 1
 
 
-def test_ingest_summary_all_failed_only_when_everything_failed():
+def test_ingest_summary_root_all_failed_for_price_failures():
     recs = [st.IngestRecord(run_id="R", dataset="price", run_at="t",
                             stock_id="2317", status="failed")]
     s = st.IngestSummary(run_id="R", statuses={"2317": "failed"}, records=recs)
-    assert s.all_failed is True
+    assert s.root_all_failed() is True
     assert s.overall_status == st.IngestStatus.FAILED.value
 
 
-def test_summary_empty_is_not_all_failed():
+def test_summary_empty_is_not_root_failure():
+    """來源正常回應但確實無資料：**不是**失敗（任務第 2 節）。"""
     recs = [st.IngestRecord(run_id="R", dataset="price", run_at="t",
                             stock_id="2330", status="success_empty")]
     s = st.IngestSummary(run_id="R", statuses={"2330": "success_empty"},
                          records=recs)
-    assert s.all_failed is False
+    assert s.root_all_failed() is False
     assert s.overall_status == st.IngestStatus.SUCCESS_EMPTY.value
 
 
@@ -356,7 +358,7 @@ def test_unknown_status_is_not_a_claimed_success():
                                                   run_at="t", stock_id="2330",
                                                   status="unknown")])
     assert s.overall_status == st.IngestStatus.UNKNOWN.value
-    assert s.all_failed is True        # 沒有可信結論時不得宣稱成功
+    assert s.root_all_failed() is True   # 沒有可信結論時不得宣稱成功
 
 
 # ==========================================================================
@@ -523,6 +525,36 @@ def test_worker_reports_success_with_data_as_ok(worker_env):
     assert worker.run_cycle(force=True) == "ok"
 
 
+def test_worker_raises_even_when_only_auxiliary_datasets_succeeded(worker_env):
+    """價量（根資料集）全失敗、但新聞成功 → **仍必須**視為整輪失敗。
+
+    否則會用陳舊價格繼續打分，產生看似正常的訊號（回歸測試）。
+    """
+    recs = [
+        st.IngestRecord(run_id="R", dataset="price", run_at="t",
+                        stock_id="2330", status="failed"),
+        st.IngestRecord(run_id="R", dataset="price", run_at="t",
+                        stock_id="2317", status="failed"),
+        st.IngestRecord(run_id="R", dataset="news", run_at="t",
+                        stock_id="2330", status="success_with_data"),
+    ]
+    s = st.IngestSummary(run_id="R", statuses={"2330": "failed",
+                                                "2317": "failed"}, records=recs)
+    assert s.usable_count > 0            # 確實有其他資料集成功
+    assert s.root_all_failed() is True   # 但根資料集全失敗 → 整輪失敗
+    worker_env.setattr(pipeline, "ingest", lambda *a, **k: s)
+    with pytest.raises(RuntimeError):
+        worker.run_cycle(force=True)
+
+
+def test_worker_runs_when_price_source_responds_empty(worker_env):
+    """價量來源正常但當日無資料 → 不應中斷打分（不是失敗）。"""
+    s = _summary({"2330": "success_empty"})
+    assert s.root_all_failed() is False
+    worker_env.setattr(pipeline, "ingest", lambda *a, **k: s)
+    assert worker.run_cycle(force=True) == "success_empty"
+
+
 # ==========================================================================
 # 紀錄欄位完整性（§2：每次執行應保留的資訊）
 # ==========================================================================
@@ -576,3 +608,134 @@ def test_report_text_does_not_claim_trading_edge():
     assert "可交易優勢" in text          # 明確聲明不宣稱優勢
     assert "有效情緒覆蓋率" in text
     assert "抓取失敗率" in text
+
+
+def test_report_renders_daily_news_counts(temp_db):
+    """§3.6 要求明確顯示「每日新聞筆數」——不能只算不顯示。"""
+    store.write_df(pd.DataFrame([
+        {"published": "2026-10-13", "stock_id": "2330", "title": "a",
+         "link": "d1", "score": 0.5, "source": "t",
+         "timestamp_source": "source", "score_kind": "scored",
+         "provenance": "recorded"},
+        {"published": "2026-10-13", "stock_id": "2330", "title": "b",
+         "link": "d2", "score": 0.0, "source": "t",
+         "timestamp_source": "source", "score_kind": "neutral",
+         "provenance": "recorded"},
+        {"published": None, "stock_id": "2330", "title": "c", "link": "d3",
+         "score": 0.0, "source": "t", "timestamp_source": "unknown",
+         "score_kind": "neutral", "provenance": "recorded"},
+    ]), "news")
+    text = report.build_report_text()
+    assert "每日新聞筆數" in text
+    assert "2026-10-13 | 2 | 1 | 1 | 0 | 0" in text      # 兩則，其中一則有分數
+    assert "(時間不明) | 1 | 0 | 1 | 0 | 1" in text
+    per = report.daily_news_counts()
+    assert set(per["date"]) == {"2026-10-13", "(時間不明)"}
+    assert per[per["date"] == "2026-10-13"].iloc[0]["rows"] == 2
+
+
+# ==========================================================================
+# §2：真實 pipeline.ingest() 是否真的寫出完整可重建的紀錄
+# ==========================================================================
+def _fake_price(sid: str, days: int = 3) -> pd.DataFrame:
+    dates = pd.bdate_range("2026-10-01", periods=days)
+    return pd.DataFrame({"date": dates, "stock_id": sid, "open": 100.0,
+                         "high": 101.0, "low": 99.0, "close": 100.0,
+                         "volume": 1e6})
+
+
+def _structured_news(sid: str) -> sentiment.NewsIngestResult:
+    """結構化新聞結果（不連外的替身），模擬成功取得並寫入一則。"""
+    return sentiment.NewsIngestResult(
+        stock_id=sid, status=st.IngestStatus.SUCCESS_WITH_DATA.value,
+        rows_fetched=2, rows_parsed=1, rows_written=1, n_scored=1,
+        data_start="2026-10-13", data_end="2026-10-13", attempts=1,
+        source_version=news_rss.NEWS_RULESET_VERSION)
+
+
+@pytest.fixture()
+def ingest_env(temp_db, monkeypatch):
+    """把 pipeline 的所有外部抓取換成可控假函式（**不連外**）。"""
+    monkeypatch.setattr(pipeline.fm, "polite_sleep", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.fm, "fetch_institutional",
+                        lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(pipeline.fm, "fetch_margin", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.fm, "fetch_revenue", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.fm, "fetch_splits", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.fm, "fetch_dividends", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.sent, "update_news_for",
+                        lambda sid, name, **k: _structured_news(sid))
+    monkeypatch.setattr(pipeline, "CONFIG",
+                        type("C", (), {"pool": {"2330": "台積電", "2317": "鴻海"},
+                                       "benchmark": "0050",
+                                       "lookback_years": 1.0})())
+    return monkeypatch
+
+
+def _run_partial_ingest(env) -> st.IngestSummary:
+    env.setattr(pipeline.fm, "fetch_benchmark",
+                lambda *a, **k: _fake_price("0050"))
+    env.setattr(pipeline.fm, "fetch_price",
+                lambda sid, *a, **k: _fake_price(sid) if sid == "2330" else None)
+    return pipeline.ingest()
+
+
+def test_pipeline_ingest_records_all_required_fields(ingest_env):
+    """§2：來源、任務、起訖時間、狀態、錯誤分類、各階段筆數、日期範圍、
+    重試次數、設定識別都必須真的寫進 DB（不是只有 dataclass 有欄位）。"""
+    summary = _run_partial_ingest(ingest_env)
+    assert summary.overall_status == st.IngestStatus.PARTIAL_SUCCESS.value
+    assert summary.statuses == {"2330": "success_with_data", "2317": "failed"}
+
+    ok = store.read_sql("SELECT * FROM ingest_run WHERE dataset='price' "
+                        "AND stock_id='2330'").iloc[0]
+    assert ok["status"] == "success_with_data"
+    assert ok["source"] == "finmind" and ok["task"] == "fetch_price"
+    assert ok["started_at"] and ok["ended_at"] and ok["run_at"]
+    assert int(ok["rows_fetched"]) == 3 and int(ok["rows_written"]) == 3
+    assert ok["data_start"] == "2026-10-01" and ok["data_end"] == "2026-10-05"
+    assert int(ok["attempts"]) >= 1
+    assert ok["config_id"] and ok["config_id"] != ""
+    assert ok["provenance"] == "recorded"
+
+    bad = store.read_sql("SELECT * FROM ingest_run WHERE dataset='price' "
+                         "AND stock_id='2317'").iloc[0]
+    assert bad["status"] == "failed" and bad["error_class"] == "network"
+    assert bad["error"] and int(bad["rows_written"]) == 0
+    # 部分失敗必須能從紀錄辨識，而不是只有一個整體退出碼
+    sts = set(store.read_sql("SELECT status FROM ingest_run WHERE dataset='price"
+                             "'")["status"])
+    assert sts == {"success_with_data", "failed"}
+
+
+def test_pipeline_records_unstructured_news_as_unknown(ingest_env):
+    """非結構化回傳不可冒充成功，只能記 unknown。"""
+    ingest_env.setattr(pipeline.sent, "update_news_for", lambda *a, **k: 0)
+    _run_partial_ingest(ingest_env)
+    news = store.read_sql("SELECT status, error_class FROM ingest_run "
+                          "WHERE dataset='news'")
+    assert len(news) == 2
+    assert set(news["status"]) == {"unknown"}
+    assert set(news["error_class"]) == {"unknown"}
+
+
+def test_pipeline_repeated_run_does_not_duplicate_records(ingest_env, monkeypatch):
+    """同一 run_id 重跑不得產生重複紀錄（幂等）。"""
+    monkeypatch.setattr(st, "new_run_id", lambda now=None: "FIXED_RUN")
+    _run_partial_ingest(ingest_env)
+    first = store.read_sql("SELECT COUNT(*) AS n FROM ingest_run").iloc[0]["n"]
+    _run_partial_ingest(ingest_env)
+    second = store.read_sql("SELECT COUNT(*) AS n FROM ingest_run").iloc[0]["n"]
+    assert first == second, "重跑同一任務產生了重複紀錄"
+
+
+def test_pipeline_never_claims_success_when_everything_fails(ingest_env):
+    """全數失敗時：不得更新 last_ingest、紀錄必須是 failed、不可冒充成功。"""
+    ingest_env.setattr(pipeline.fm, "fetch_benchmark", lambda *a, **k: None)
+    ingest_env.setattr(pipeline.fm, "fetch_price", lambda *a, **k: None)
+    summary = pipeline.ingest()
+    assert summary.root_all_failed() is True
+    assert summary.overall_status == st.IngestStatus.FAILED.value
+    assert store.get_meta("last_ingest") is None
+    assert store.get_meta("last_ingest_status") == "failed"
+    assert store.get_meta("last_ingest_failed_ids") == "2330,2317"

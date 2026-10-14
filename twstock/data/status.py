@@ -36,6 +36,10 @@ log = logging.getLogger(__name__)
 # 資料庫中代表「來源與任務」的識別
 DATASET_NEWS = "news"
 DATASET_PRICE = "price"
+
+# 根資料集：價量是後續所有分析（特徵、打分、回測）的根。
+# 它全數失敗時，其他資料集再成功也不能算「這一輪成功」。
+ROOT_DATASET = DATASET_PRICE
 INGEST_RUN_TABLE = "ingest_run"
 
 RECORDED = "recorded"      # 本階段之後寫入、狀態可追溯
@@ -316,16 +320,24 @@ class IngestSummary:
     def has_data(self) -> bool:
         return any(IngestStatus(r.status).has_data for r in self.records)
 
-    @property
-    def all_failed(self) -> bool:
-        """整輪完全無可用結果（全數硬性失敗）→ 才可視為整輪失敗。
+    def dataset_statuses(self, dataset: str) -> list[str]:
+        return [r.status for r in self.records if r.dataset == dataset]
 
-        只要有任何紀錄是 success_with_data / success_empty / partial_success，
-        就不算整輪失敗——「來源正常但沒有資料」不是失敗。
+    def root_all_failed(self, dataset: str = ROOT_DATASET) -> bool:
+        """**根資料集**（預設價量）是否全數硬性失敗 → 整輪應視為失敗。
+
+        為何只認根資料集：價量是特徵／打分／回測的根。若價量全部失敗、
+        僅新聞或籌碼成功，仍然不能繼續打分——那會用**陳舊價格**產生看似
+        正常的訊號。只看「所有資料集是否都失敗」會讓這種情況漏過。
+
+        反之，「來源正常回應但確實沒有資料」是 ``success_empty``，
+        **不是**失敗（任務第 2 節要求）。
         """
-        if not self.records:
+        sts = self.dataset_statuses(dataset)
+        if not sts:
+            # 根資料集完全沒有紀錄 → 沒有可信結論，不可當成成功
             return True
-        return self.usable_count == 0
+        return all(s == IngestStatus.FAILED.value for s in sts)
 
     def label(self) -> str:
         c = self.status_counts()
