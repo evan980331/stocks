@@ -23,9 +23,8 @@ from dataclasses import dataclass, field
 from urllib.parse import quote
 
 from ..data import status as st
-from .news_rss import (ERR_NONE, FAILED, SUCCESS_EMPTY, SUCCESS_WITH_DATA,
-                       FeedFetchResult, _score_text, fetch_feed,
-                       ruleset_fingerprint)
+from .news_rss import (ERR_NONE, FAILED, SUCCESS_EMPTY, FeedFetchResult,
+                       _score_text, fetch_feed, ruleset_fingerprint)
 
 log = logging.getLogger(__name__)
 

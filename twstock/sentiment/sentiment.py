@@ -154,38 +154,3 @@ def update_news_for(stock_id: str, name: str, days: int = 7, *,
         except Exception as e:  # noqa: BLE001
             log.warning("寫入新聞擷取紀錄失敗：%s", e)
     return res
-
-
-def news_status_counts(run_id: str | None = None) -> dict[str, int]:
-    """由 ``ingest_run`` 統計新聞擷取狀態（供資料品質報告使用）。"""
-    sql = ("SELECT status, COUNT(*) AS n FROM ingest_run WHERE dataset=? "
-           + ("AND run_id=? " if run_id else "")
-           + "GROUP BY status")
-    params: tuple = (st.DATASET_NEWS, run_id) if run_id else (st.DATASET_NEWS,)
-    df = store.read_sql(sql, params)
-    if df.empty:
-        return {}
-    return {str(r.status): int(r.n) for r in df.itertuples()}
-
-
-def news_daily_counts() -> pd.DataFrame:
-    """每日新聞筆數與情緒型態（含『時間不明』欄位）。"""
-    df = store.read_sql(
-        "SELECT published, score, score_kind, timestamp_source, provenance "
-        "FROM news")
-    if df.empty:
-        return pd.DataFrame(columns=["date", "rows", "scored", "neutral",
-                                     "missing_score", "unknown_timestamp"])
-    d = df.copy()
-    d["date"] = d["published"].astype("string").fillna("(時間不明)")
-    kind = d["score_kind"].astype("string").fillna("missing")
-    d["_scored"] = (kind == "scored").astype(int)
-    d["_neutral"] = (kind == "neutral").astype(int)
-    d["_missing"] = (kind == "missing").astype(int)
-    d["_unknown_ts"] = (d["timestamp_source"].astype("string")
-                        != "source").astype(int)
-    g = d.groupby("date", dropna=False).agg(
-        rows=("score", "size"), scored=("_scored", "sum"),
-        neutral=("_neutral", "sum"), missing_score=("_missing", "sum"),
-        unknown_timestamp=("_unknown_ts", "sum")).reset_index()
-    return g.sort_values("date").reset_index(drop=True)

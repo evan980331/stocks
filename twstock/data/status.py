@@ -139,19 +139,6 @@ def classify(*, error_class: str = ErrorClass.NONE.value, written: int = 0,
     return IngestStatus.SUCCESS_EMPTY.value
 
 
-def error_class_from_exception(exc: BaseException | None) -> str:
-    """把例外映射到可重現的分類（供重試決策與健檢統計）。"""
-    if exc is None:
-        return ErrorClass.NONE.value
-    if isinstance(exc, TimeoutError):
-        return ErrorClass.TIMEOUT.value
-    if isinstance(exc, (ConnectionError, OSError)):
-        return ErrorClass.NETWORK.value
-    if isinstance(exc, (ValueError, KeyError, TypeError)):
-        return ErrorClass.VALIDATION.value
-    return ErrorClass.UNKNOWN.value
-
-
 # --------------------------------------------------------------------------
 # 機密遮蔽
 # --------------------------------------------------------------------------
@@ -376,7 +363,3 @@ class IngestSummary:
         if n_unk == n:
             return IngestStatus.UNKNOWN.value
         return IngestStatus.SUCCESS_EMPTY.value
-
-
-def empty_summary() -> IngestSummary:
-    return IngestSummary()

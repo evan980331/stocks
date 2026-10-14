@@ -246,14 +246,3 @@ def build_report_text(run_id: str | None = None) -> str:
 
 def _pct(v: float | None) -> str:
     return "無可判定紀錄" if v is None else f"{v:.1%}"
-
-
-def build_report() -> dict:
-    """結構化報告（供程式使用）。"""
-    return {
-        "run_id": latest_run_id(),
-        "news_coverage": news_coverage(),
-        "news_fetch_rates": fetch_rates(NEWS_DATASET),
-        "price_fetch_rates": fetch_rates(st.DATASET_PRICE),
-        "status_summary": ingest_status_summary(),
-    }
