@@ -602,7 +602,9 @@ python -m pytest -q
 | 1 | `7cd9f3c` | `feat(data): 擷取狀態治理，讓失敗不再降級成「沒有資料」` | data/status.py、data/report.py、store.py（`ingest_run`＋news 溯源欄位＋`WriteRejected`）、`conftest.py`（autouse 隔離） |
 | 2 | `c08721c` | `fix(sentiment): 新聞抓取失敗不再偽裝成沒有新聞，時間戳不臆測` | news_rss.py（`fetch_feed`）、sentiment.py、experts.py、pipeline.py |
 | 3 | `de6b82b` | `fix(worker): 依結構化狀態判定成敗，並新增資料品質檢查指令` | worker.py、ops.py、cli.py（`datacheck`）、`test_ingest_governance.py`（43） |
-| 4 | （本 commit） | `docs: 記錄 P2.7 擷取狀態治理結果、資料品質統計與技術債` | README.md、plan.md、STATUS_REPORT.md、DATA_SOURCES.md |
+| 4 | `5f4c1d7` | `docs: 記錄 P2.7 擷取狀態治理結果、資料品質統計與技術債` | README.md、plan.md、STATUS_REPORT.md、DATA_SOURCES.md |
+| 5 | `770abd0` | `refactor(data): 移除未使用的狀態與報告輔助函式` | status.py、sentiment.py、report.py、experts.py（不改變行為） |
+| 6 | （本 commit） | `docs(plan): 補上本輪 commit 表與最終驗證紀錄` | plan.md |
 
 **每個 commit 皆在 detached worktree 檢出完整快照獨立驗證過**（非只在最終狀態跑一次）：
 
@@ -628,6 +630,7 @@ python -m pytest -q
 | `python -m twstock.cli --help` | 列出 `datacheck` | **0** |
 | `python -m compileall -q -f twstock tests` | 全部編譯成功、**無 SyntaxWarning** | **0** |
 | 真實 DB 雜湊（跑完完整 `pytest` 前後） | **不變**（`md5 e4970d6f…`） | — |
+| 移除死碼後重跑 `pytest` ＋五個 CLI | 同上全數通過（受影響檔案已重驗） | **0** |
 
 **研究影響檢查（任務第 6 節，實測而非推論）**：
 
@@ -643,6 +646,14 @@ python -m pytest -q
 
 **本階段結論（一句話）**：修復後**策略與訊號完全沒變**；變的是
 「我們現在知道哪些資料可信、哪些不知道」而已——而過去連「不知道」都看不出來。
+
+**本階段自行複核後補修的項目**（不是一次就寫對，如實記錄）：
+1. 新增的 docstring 使用 `\(` 造成 `SyntaxWarning`（已修正，並確認全部檔案在
+   `-W error` 下編譯無警告）。
+2. 第 2 個 commit 原本會讓 `pipeline.ingest_experts` 暫時壞掉（`collect_experts`
+   改了回傳型態）→ worktree 驗證時發現，已調整切分使該快照可獨立運作。
+3. 五個只有定義、沒有呼叫端的符號，以及一個未使用的匯入（已移除）。
+4. 文件初稿以簡體／異體字寫入（刪、拋）→ 已修正為繁體，並以字元掃描確認。
 
 ---
 
