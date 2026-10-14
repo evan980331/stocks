@@ -240,6 +240,12 @@ def build_features(price: pd.DataFrame,
                                 "w_score": float(row["score"]) * w})
         dec = (pd.DataFrame(decayed).groupby("date")["w_score"].mean().reset_index())
         df = df.merge(dec, on="date", how="left")
+        # 「有可用新聞資料」與「有效情緒值為 0」必須可分：單看 news_sentiment
+        # 無法區分（fillna(0.0) 兩者都變成 0），缺值也不得解讀為中性情緒。
+        # news_present = 1 表示該 (股票, 日期) 有衰減窗口內的新聞記錄；
+        # = 0 表示沒有新聞（不等於「情緒中性」）。B17 消融（twstock.ablation）
+        # 與方案 D 據此把缺值排除於分數計算之外。
+        df["news_present"] = df["w_score"].notna().astype(float)
         df["news_sentiment"] = df["w_score"].fillna(0.0)
         df = df.drop(columns=["w_score"])
 
