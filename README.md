@@ -69,6 +69,20 @@ python -m twstock.attribution --sims 500
 進場延遲、週轉來源、曝險、集中度與成本。
 輸出於 `twstock/reports/attribution_*.txt`。
 
+### B17 新聞因子消融（該不該改權重？）
+
+```bat
+python -m twstock.ablation           :: 完整；含交易層級配對回測
+python -m twstock.ablation --quick   :: 少量模擬次數（快速檢查）
+```
+
+在同一面板、成本與交易規則下配對比較四個方案（A 現行 / B 移除並重新標準化 /
+C 固定權重 / D 可用性閘門）加一個分解控制組 A\*，並驗證**排名是否只是被乘上常數**
+（實測：可用權重跨股變動 → 不是常數，排名真的會改變）。
+另以配對日報酬的 Newey-West 檢定提供交易層級不確定性。
+**結論：不修改正式策略**（86 個配對假設校正後無一顯著，test 段成交完全相同）。
+完整結果見 `docs/ABLATION_B17.md`，逐行輸出於 `twstock/reports/ablation_*.txt`。
+
 ### 服務生命週期
 
 ```bat
@@ -94,6 +108,10 @@ twstock/
   costs.py             # 交易成本模型與 6 組情境（含流動性上限）
   strategies.py        # 策略規格：持有期間、進出場門檻、再平衡頻率
   validation.py        # 樣本外驗證：切分、purge/embargo、基準檢查、比較報告
+  diagnostics.py       # 訊號資訊量診斷：IC／分組／隨機基準／多重檢定
+  attribution.py       # 策略失效歸因：隨機選股與完美前瞻控制組
+  ablation.py          # B17 消融：四方案配對比較與排名不變性驗證
+  jobs.py              # 耗時任務子程序隔離（合作式取消，不用 CTRL_BREAK）
   data/
     finmind_client.py  # FinMind API v4（失敗回 None，與「空資料」區分）
     store.py           # SQLite：INSERT OR REPLACE 冪等寫入，永不 DROP 表
