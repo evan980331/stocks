@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS news (
     score_kind TEXT,       -- scored：有非零情緒分數；neutral：存在但中性；
                            -- missing：無有效分數
     provenance TEXT,       -- recorded：本階段之後；unknown：不可追溯的舊資料
+    news_uid TEXT,         -- 穩定的新聞識別碼（內容雜湊；跨股票可比對，舊列為 NULL）
+    content_hash TEXT,     -- 可重現的內容雜湊（標題＋正規化連結＋發布時間）
+    run_id TEXT,           -- 寫入該列的擷取任務（→ ingest_run；舊列不可追溯）
+    link_basis TEXT,       -- 股票關聯依據：title_match（標題可驗證）/
+                           -- rss_query（僅依查詢關聯，內容無法驗證）/ unknown
+    source_version TEXT,   -- 寫入該列時的情緒規則版本（可重現當初的分數）
     PRIMARY KEY (stock_id, link)
 );
 CREATE TABLE IF NOT EXISTS signals (
@@ -155,7 +161,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "price": [("amount", "REAL"), ("turnover", "REAL")],
         "news": [("published_at", "TEXT"), ("fetched_at", "TEXT"),
                  ("timestamp_source", "TEXT"), ("score_kind", "TEXT"),
-                 ("provenance", "TEXT")],
+                 ("provenance", "TEXT"), ("news_uid", "TEXT"),
+                 ("content_hash", "TEXT"), ("run_id", "TEXT"),
+                 ("link_basis", "TEXT"), ("source_version", "TEXT")],
     }
     for table, cols in wanted.items():
         existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -165,8 +173,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
                 log.info("migrate: %s 新增欄位 %s", table, name)
+    _ensure_news_indexes(conn)
     _mark_legacy_news(conn)
     _backfill_ingest_run(conn)
+
+
+def _ensure_news_indexes(conn: sqlite3.Connection) -> None:
+    """新聞表查詢索引（必須在補欄位**之後**才建，舊 DB 才不會因欄位不存在而失敗）。
+
+    每日累積的冪等查詢、point-in-time 過濾（依 fetched_at / published）
+    與跨股票同新聞比對（news_uid）都需要索引；否則會隨資料累積線性變慢。
+    """
+    for stmt in (
+        "CREATE INDEX IF NOT EXISTS idx_news_uid ON news(news_uid)",
+        "CREATE INDEX IF NOT EXISTS idx_news_fetched ON news(fetched_at)",
+        "CREATE INDEX IF NOT EXISTS idx_news_published ON news(published)",
+        "CREATE INDEX IF NOT EXISTS idx_news_run ON news(run_id)",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.Error as e:  # pragma: no cover - 防止索引問題阻斷開檔
+            log.warning("建索引失敗（不影響寫入）：%s (%s)", stmt, e)
 
 
 def _meta_get(conn: sqlite3.Connection, key: str) -> str | None:
@@ -272,7 +299,8 @@ class WriteRejected(RuntimeError):
 
 
 def write_df(df: pd.DataFrame, table: str,
-             key_cols: Sequence[str] | None = None) -> int:
+             key_cols: Sequence[str] | None = None,
+             *, if_conflict: str = "replace") -> int:
     """以 INSERT OR REPLACE 寫入 DataFrame。
 
     - 僅寫入該表已存在的欄位（容忍來源欄位變動）。
@@ -280,9 +308,19 @@ def write_df(df: pd.DataFrame, table: str,
     - 回傳實際寫入列數。
     - 有資料但**無交集欄位**時擲出 ``WriteRejected``，不再靜默回 0，
       以免呼叫端把完全沒寫入當成成功。
+
+    ``if_conflict``
+      - ``"replace"``（預設）：依主鍵覆寫，適合價量等可重建資料。
+      - ``"ignore"``：**首次寫入即定案**——已存在的主鍵整列跳過。
+        新聞採用此模式：重複抓取不覆寫既有列，因此既有的
+        ``fetched_at``（point-in-time 可用起點）、``provenance``
+        與分數都不會被後來的抓取改寫，舊資料的 ``unknown``
+        也不會被自動升級為已確認。回傳值＝**真正新增**的列數。
     """
     if df is None or df.empty:
         return 0
+    if if_conflict not in ("replace", "ignore"):
+        raise ValueError(f"if_conflict 必須是 replace 或 ignore，得到 {if_conflict!r}")
     if is_readonly():
         raise RuntimeError("唯讀模式（TWSTOCK_READONLY）不允許寫入")
     conn = _connect()
@@ -300,7 +338,8 @@ def write_df(df: pd.DataFrame, table: str,
         keys = tuple(key_cols or PRIMARY_KEYS.get(table, ()))
         on_conflict = ""
         if keys and all(k in known for k in keys):
-            on_conflict = " OR REPLACE"
+            on_conflict = (" OR IGNORE" if if_conflict == "ignore"
+                           else " OR REPLACE")
         else:
             log.warning("write_df: %s 主鍵 %s 不完整，改用 INSERT", table, keys)
         placeholders = ",".join("?" * len(cols))
@@ -308,8 +347,12 @@ def write_df(df: pd.DataFrame, table: str,
                f"VALUES ({placeholders})")
         rows = [tuple(_adapt(v) for v in rec)
                 for rec in df[cols].itertuples(index=False, name=None)]
+        before = conn.total_changes
         conn.executemany(sql, rows)
         conn.commit()
+        if if_conflict == "ignore":
+            # OR IGNORE 會略過既有主鍵，total_changes 只算真正新增的列
+            return int(conn.total_changes - before)
         return len(rows)
     finally:
         conn.close()

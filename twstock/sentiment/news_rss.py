@@ -22,7 +22,8 @@ import datetime as dt
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import (parse_qs, parse_qsl, quote, urlencode, urlparse,
+                          urlunparse)
 
 import feedparser
 import requests
@@ -106,6 +107,85 @@ def _decode_google_link(link: str) -> str | None:
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+# --------------------------------------------------------------------------
+# 新聞識別與可重現性（P2.8）
+#
+# Google News RSS **不保證**每則都帶 guid，且同一文章在不同時間抓取時，
+# 連結可能帶有 utm_* / fbclid / oc 等追蹤參數。因此採取三層去重鍵，
+# 依序回退，並把採用哪一層寫進 ``news_uid`` 本身的前綴，讓去重依據可稽核：
+#   guid:   來源提供的穩定識別碼（若存在）
+#   link:   正規化後的連結（去掉追蹤參數與片段）
+#   content:標題＋正規化連結＋發布時間的內容雜湊（連結也沒有時）
+# --------------------------------------------------------------------------
+_TRACKING_PARAMS = frozenset({"fbclid", "gclid", "oc", "oc5", "mbid"})
+
+
+def normalize_link(link: str) -> str:
+    """正規化連結：小寫主機、移除追蹤參數與片段。
+
+    只移除**不改變文章身分**的參數（utm_*、點擊 ID、Google News 的 oc）；
+    其餘查詢參數一律保留，避免把不同文章誤併成同一則（任務 §7 要求）。
+    """
+    s = (link or "").strip()
+    if not s:
+        return ""
+    try:
+        u = urlparse(s)
+        if u.scheme and u.netloc:
+            q = [(k, v) for k, v in parse_qsl(u.query)
+                 if not k.lower().startswith("utm_")
+                 and k.lower() not in _TRACKING_PARAMS]
+            return urlunparse((u.scheme.lower(), u.netloc.lower(), u.path,
+                               "", urlencode(q), ""))
+    except Exception:  # noqa: BLE001
+        pass
+    return s
+
+
+def content_hash(title: str, link: str, published_at: str | None) -> str:
+    """可重現的內容雜湊：標題＋正規化連結＋發布時間。
+
+    同樣的輸入必得同樣的雜湊（與執行時間、執行緒、資料庫狀態無關），
+    供事後驗證「這一列當初是從什麼內容算出來的」。
+    """
+    blob = "\x1f".join([(title or "").strip(), normalize_link(link),
+                        published_at or ""])
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def news_uid(*, guid: str = "", link: str = "", title: str = "",
+             published_at: str | None = None) -> str:
+    """穩定的新聞識別碼（帶去重依據前綴，供稽核）。
+
+    同一篇文章不論從哪個來源／哪一檔股票的 feed 抓到，都會得到相同 uid，
+    因此報表可以區分「列數（每股一條）」與「去重後總數（實際幾則新聞）」。
+    """
+    g = (guid or "").strip()
+    if g:
+        return "guid:" + hashlib.sha256(g.encode("utf-8")).hexdigest()
+    norm = normalize_link(link)
+    if norm:
+        return "link:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    return "content:" + content_hash(title, link, published_at)
+
+
+def link_basis_for(stock_id: str, name: str, title: str) -> str:
+    """股票關聯依據（不可虛構）。
+
+    - ``title_match``：標題內可驗證地出現代號或公司名。
+    - ``rss_query``：僅因為用「代號 OR 公司名」查詢而關聯，內文未驗證。
+    - ``unknown``：連查詢鍵都沒有，無法主張關聯。
+
+    回報報表會把後兩者列為「無法確認關聯」，不把查詢關聯當成內容驗證。
+    """
+    t = title or ""
+    if (stock_id and stock_id in t) or (name and name in t):
+        return "title_match"
+    if stock_id or name:
+        return "rss_query"
+    return "unknown"
 
 
 # --------------------------------------------------------------------------
@@ -263,7 +343,7 @@ class NewsFetchResult:
 
 
 def _news_item(entry, stock_id: str, fetched_at: str, fetched_ts: float,
-               cutoff_ts: float) -> tuple[dict | None, str]:
+               cutoff_ts: float, name: str = "") -> tuple[dict | None, str]:
     """把單一 RSS 條目轉為新聞列。回傳 (列或 None, 排除原因)。"""
     ts = None
     if getattr(entry, "published_parsed", None):
@@ -302,6 +382,13 @@ def _news_item(entry, stock_id: str, fetched_at: str, fetched_ts: float,
         "fetched_at": fetched_at,
         "timestamp_source": timestamp_source,
         "provenance": "recorded",
+        # 可追溯性（P2.8）：穩定識別碼、可重現內容雜湊、股票關聯依據、規則版本
+        "news_uid": news_uid(guid=getattr(entry, "id", "") or "",
+                             link=real or link, title=title,
+                             published_at=published_at),
+        "content_hash": content_hash(title, real or link, published_at),
+        "link_basis": link_basis_for(stock_id, name, title),
+        "source_version": NEWS_RULESET_VERSION,
     }
     return item, ""
 
@@ -338,7 +425,7 @@ def fetch_google_news(stock_id: str, name: str, days: int = 7, *,
     items: list[dict] = []
     for e in feed.entries[:20]:
         item, why = _news_item(e, stock_id, feed.fetched_at, fetched_ts,
-                              cutoff_ts)
+                              cutoff_ts, name=name)
         if item is None:
             if why == "future":
                 base.n_future_skipped += 1

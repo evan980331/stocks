@@ -41,7 +41,8 @@ class NewsIngestResult:
     error: str = ""
     rows_fetched: int = 0        # 來源回應中看到的條目數
     rows_parsed: int = 0         # 通過時間戳檢核、準備寫入的列數
-    rows_written: int = 0        # 實際寫入（含覆寫既有鍵）
+    rows_written: int = 0        # **真正新增**的列數（已存在者整列跳過）
+    n_existing: int = 0          # 已存在而跳過的列數（重複抓取不重計）
     n_neutral: int = 0
     n_scored: int = 0
     n_missing_timestamp: int = 0
@@ -59,7 +60,8 @@ class NewsIngestResult:
 
     def label(self) -> str:
         return (f"{self.stock_id} 新聞 {st.IngestStatus(self.status).label}"
-                f"（取得 {self.rows_fetched}／寫入 {self.rows_written}，"
+                f"（取得 {self.rows_fetched}／新增 {self.rows_written}，"
+                f"既有 {self.n_existing}，"
                 f"中性 {self.n_neutral}、有分數 {self.n_scored}、"
                 f"時間不明 {self.n_missing_timestamp}）"
                 + (f"｜{self.error_class}: {self.error}" if self.error else ""))
@@ -82,8 +84,12 @@ def update_news_for(stock_id: str, name: str, days: int = 7, *,
     重要（W3）：只以 ``(stock_id, link)`` 主鍵覆寫**這一檔**的新聞，絕不可整表覆蓋，
     否則每抓一檔股票就會清空其他所有股票的新聞。
 
-    Idempotency：同一 (stock_id, link) 重複執行為 ``INSERT OR REPLACE``，
-    不會產生重複資料。
+    Idempotency（P2.8 改為「首次寫入即定案」）：同一 (stock_id, link)
+    重複執行為 ``INSERT OR IGNORE``——**已存在的列整列跳過**，不覆寫。
+    理由：重複抓取若覆寫既有列，會把 ``fetched_at``（point-in-time 可用起點）
+    改成新的時間，使「當初什麼時候看得到這則新聞」變得不可重建；
+    也可能把舊資料的 ``provenance='unknown'` 自動升級成已確認（任務禁止）。
+    因此 ``rows_written`` 代表**真正新增**，``n_existing`` 代表重複抓取命中。
     """
     run_id = run_id or st.new_run_id()
     run_at = run_at or st.now_iso()
@@ -122,16 +128,32 @@ def update_news_for(stock_id: str, name: str, days: int = 7, *,
             blank = df["link"] == ""
             df.loc[blank, "link"] = ("title:"
                                      + df.loc[blank, "title"].fillna("").astype(str))
+            # 溯源：讓每一列都能對回本次擷取任務與情緒規則版本
+            df["run_id"] = run_id
+            if "source_version" not in df.columns:
+                df["source_version"] = news_rss.NEWS_RULESET_VERSION
+            if "news_uid" not in df.columns:
+                # 防御路徑：來源未提供識別碼時，以可重現的內容雜湊產生
+                df["news_uid"] = [
+                    news_rss.news_uid(
+                        link=str(r.link), title=str(getattr(r, "title", "")),
+                        published_at=(None if pd.isna(getattr(r, "published_at", None))
+                                      else str(r.published_at)))
+                    for r in df.itertuples(index=False)]
             try:
-                n = store.write_df(df, "news", key_cols=("stock_id", "link"))
+                n = store.write_df(df, "news", key_cols=("stock_id", "link"),
+                                   if_conflict="ignore")
             except Exception as e:  # noqa: BLE001
                 res.status = st.IngestStatus.FAILED.value
                 res.error_class = st.ErrorClass.WRITE.value
                 res.error = f"{type(e).__name__}: {e}"
             else:
                 res.rows_written = n
-                # 有新聞但全部中性 vs 有有效分數，狀態相同但計數可分
-                res.status = (st.IngestStatus.SUCCESS_WITH_DATA.value if n > 0
+                res.n_existing = int(len(df)) - int(n)
+                # 狀態看「來源是否有提供有效資料」，而不是「這次有沒有新增」：
+                # 重複抓取全部命中既有列時仍是 success_with_data（來源正常有資料），
+                # 不可誤記為 success_empty（那會讓「沒有新聞」與「重複新聞」混同）。
+                res.status = (st.IngestStatus.SUCCESS_WITH_DATA.value if len(df)
                               else st.IngestStatus.SUCCESS_EMPTY.value)
 
     ended = st.now_iso()
@@ -146,7 +168,7 @@ def update_news_for(stock_id: str, name: str, days: int = 7, *,
         data_start=res.data_start, data_end=res.data_end,
         attempts=res.attempts, source_version=res.source_version,
         config_id=config_id, provenance=st.RECORDED,
-        notes=fetched.as_notes())
+        notes=(fetched.as_notes() + f" existing={res.n_existing}"))
     res.record = rec
     if write_record:
         try:
