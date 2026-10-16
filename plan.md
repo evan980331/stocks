@@ -536,12 +536,16 @@ python -m pytest -q
 | B19 | Worker 逾時仍**無法中止**已執行的任務；子程序原型已備但**尚未接進** `worker.run_forever` | 中 | 原型 `VERIFIED`（W20）；接線 `TODO` |
 | B20 | 沒有 CI：測試、驗證與診斷報告均靠手動執行，缺乏回歸防護 | 中 | `TODO` |
 | B21 | **歷史新聞的抓取成敗不可追溯**：237 則全部寫在狀態治理之前，且舊程式會用「今天」
-偽造缺失的發布時間 → 無法分辨哪些日期是真的 | 高 | 已標為 `unknown`（W23）；**不可重建**，需靠新增的跨期資料重建可信歷史 |
+偽造缺失的發布時間 → 無法分辨哪些日期是真的 | 高 | 已標為 `unknown`（W23）；**不可重建**，需靠新增的跨期資料重建可信歷史。P2.8 已將此類列排除於訊號路徑（不可作為可見時間的證據） |
 | B22 | **新聞來源為公開 RSS（非正式 API）**：無 SLA、可能變更格式或封鎖；
 現已可區分失敗（parse／http_status），但仍無備援來源 | 中 | `TODO`（`DATA_SOURCES.md` 列有交叉驗證來源） |
 | B23 | 僅能取得「最近 `days` 日」的新聞，**無法回溯歷史**（RSS 特性）→ 新聞因子的
-跨期評估先天受限 | 高 | `TODO`（需改為按日累積寫入並長期保存，或改用付費歷史新聞源） |
+跨期評估先天受限 | 高 | 收集流程 `DONE`（P2.8 每日冪等累積 + 可稽核切點）；**分析**仍 `TODO`——須累積至最低觀察期間才可評估 |
 | B24 | `signals.py` 的 `WEIGHTS` 註解寫「總和 = 1.0」，實測總和為 **1.05** | 低 | `TODO`（註解錯誤，不影響分數） |
+| B25 | **前視偏差（P2.8 修正）**：`load_panel` 曾以 `published` 當可用日，
+使事後才抓到的新聞回填到較早交易日 | 高 | `DONE`（`data/pointintime.py`，14 測試；`ABLATION_B17.md` 不再重現已明確標示） |
+| B26 | **公開 RSS 缺穩定識別碼與可靠發布時間**：`news_uid` 採 guid→link→content
+三層回退，發布時間來源未提供時一律 NULL | 中 | `DONE`（可稽核、不臆測）；限制已記錄於 `docs/DATA_SOURCES.md` |
 
 ---
 
@@ -552,7 +556,7 @@ python -m pytest -q
 | branch | `main` |
 | remote | `origin` → `https://github.com/evan980331/stocks` |
 | P0 起始 HEAD | `794a0ff chore: init TW stock predictor project` |
-| 本輪 commit | 見文末「本輪 commit」 |
+| 本輪 commit | 見文末「本輪 commit（P2.8）」 |
 | push | 依使用者授權執行（見 §12 回報） |
 
 ---
@@ -561,8 +565,9 @@ python -m pytest -q
 
 - `python -m pytest -q` → 全部通過（見 §9 / §11）。
 - 本地儀表板可啟動並回應 `GET /` 200（`http://127.0.0.1:8000`）。
-- 見文末「最後驗證（P2.7）」。
-- `python -m twstock.cli datacheck` → 退出碼 0（新增；只描述資料可信度）。
+- 見文末「最後驗證（P2.8）」。
+- `python -m twstock.cli datacheck` → 退出碼 0（雙涵蓋區間、失敗與空結果分開、來源與關聯覆蓋率）。
+- `python -m twstock.cli research` → 退出碼 0（research 模組 14 測試）。
 
 ---
 
@@ -584,17 +589,80 @@ python -m pytest -q
 6. **P4**：模擬券商 + 委託狀態機（`risk.py` 已有檢查層）——但**只有在訊號
    真的有樣本外優勢時才值得做**，否則只是把一個沒有優勢的策略自動化。
 7. **B1 決策**：是否安裝 `lightgbm`/`scikit-learn`（需使用者決定）。
-8. **B21/B23 新聞可追溯性（本階段新增，優先於 B17 重評）**：現有 237 則新聞
-   的抓取成敗與時間戳來源**全部不可判定**，且 RSS 無法回溯歷史。
-   在評估任何新聞因子之前，必須先**按日累積寫入並長期保存**（或取得付費歷史新聞源），
-   否則重評 B17 仍然沒有可信的分母。這比調權重重要。
+8. **B23 累積已就緒、只差時間**：P2.8 已完成按日冪等累積、point-in-time 可用性、
+   可稽核時間切點與最低觀察期間（120／建議 250 交易日）。
+   **目前唯一該做的事是每天讓擷取照常執行並記錄切點**，不要在期間未滿前
+   偷看前瞻結果並調整策略（B21 的 237 則舊新聞已終結，不可用來重評）。
 9. **B22 備援新聞來源**：公開 RSS 無 SLA；失敗現在可觀測，但沒有第二來源可交叉驗證。
 10. **小修（低優先）**：`signals.py` 的 `WEIGHTS` 註解寫「總和 = 1.0」，
    實測總和為 **1.05**（不影響分數，因會再標準化，但註解錯誤）。
 
 ---
 
-## 本輪 commit（P2.7，2026-10-15，已 push 至 `origin/main`）
+## 本輪 commit（P2.8，2026-10-16，已 push 至 `origin/main`）
+
+起始 HEAD = `6acee94`（`origin/main`）；結束 HEAD 見文末。無 force push、
+未覆蓋任何未提交修改。**本階段未修改因子權重、曝險、持有期間或交易規則；
+未開真實下單、未購買資料服務、未部署。**
+
+| 順序 | SHA | 訊息 | 內容 |
+|---|---|---|---|
+| 1 | `5cff235` | `feat(news): 建立可追溯新聞模型與首次寫入即定案的累積寫入（P2.8 §2-§3）` | store.py（+5 溯源欄位、4 索引、`if_conflict="ignore"`）、news_rss.py（news_uid／content_hash／normalize_link／link_basis）、sentiment.py + `test_news_accumulation.py`（16） |
+| 2 | `d56bcb9` | `fix(features): 新聞改用 point-in-time 可用性，發布時間不再冒充可見時間（P2.8 §5）` | data/pointintime.py（新）、`data/__init__.py`、pipeline.py、ablation.py（凍結報告提醒）+ `test_pointintime.py`（14）、`test_ablation.py`（+2） |
+| 3 | `1d9e5d3` | `feat(report): datacheck 區分「當日新增／當日發布」並新增來源與關聯覆蓋率（P2.8 §4）` | data/report.py、`test_news_report.py`（11） |
+| 4 | `e726e39` | `feat(research): 凍結研究版本、每日稽核切點與事前宣告的最低觀察期間（P2.8 §6）` | research.py（新）、store.py（`research_cutoff`）、cli.py（`research`）+ `test_research.py`（14） |
+| 5 | （本 commit） | `docs: 記錄 P2.8 新聞累積、point-in-time 與前瞻資料集規則` | plan.md、STATUS_REPORT.md、DATA_SOURCES.md |
+
+### 本階段發現的真實缺陷與研究影響（實測，非推論）
+
+1. **前視偏差（B25，最嚴重）**：`pipeline.load_panel` 原本以
+   `SELECT published as date` 直接把發布時間當成可用時間。一則「發布於 D、
+   但在 D 之後才被抓到」的新聞會被回填到 D 及其衰減窗口——等於把事後才知道的
+   資訊塞進當時的訊號。已改為 `max(published, fetched_at)`，並把舊資料
+   （`fetched_at` 不可得）排除於訊號路徑之外。
+2. **分母效應被量化並固定成測試**：舊資料被排除後，`news_sentiment` 欄位
+   整個**消失**（不是變成 0）→ 打分分母少掉 0.10 權重。兩者不可混同：
+   前者是「沒有可追溯的新聞」，後者是「有新聞但情緒中性」。
+3. **凍結研究產物不再重現（已明確告知）**：`docs/ABLATION_B17.md` 的數字
+   算在 P2.8 之前的面板上，`ablation` 重跑**不會**重現它；已在報告中
+   以醒目提醒標出，避免把差異誤讀成新發現。
+4. **唯讀模式對未遷移舊 DB 會擲錯**：`report` 與 `pointintime` 在唯讀模式下
+   若 DB 缺少新欄位／表會直接失敗。已改為缺欄位視為不可追溯、缺表視為無紀錄。
+
+### 最低觀察期間（§6.7；事前宣告，不得依未來績效反向選擇）
+
+- **最低：120 個交易日（約 6 個月）；建議用於正式結論：250 個交易日（約一年）。**
+- 理由（依檢定力與季節性覆蓋，不是依績效）：
+  1. 現行策略持有 5 日、每日再平衡，以既有換手率（約每日 5 回合）計，
+     120 日約 600 回合，遠高於 `validation.MIN_TRADES_FOR_CONCLUSION＝20`。
+  2. 至少涵蓋一次連續 3 個月的月營收週期與一季財報，
+     否則營收／新聞因子只在一種季節性下被檢驗。
+  3. 約為現有 walk-forward 摺數可比長度的兩倍，降低單一市場狀態主宰結果的機會。
+- 評估方式：只用凍結後新累積的 `prospective` 資料；`consumed_test`（B17 那批）
+  已消耗，**不得重用**。未達最低期間前**只報告資料品質與覆蓋率**，
+  不宣稱新聞因子或策略具備可交易優勢。
+- 落地方式：`python -m twstock.cli research freeze` 凍結研究版本、
+  `python -m twstock.cli research cutoff` 每日記錄可稽核切點（冪等，首次寫入即定案）、
+  `python -m twstock.cli research` 檢視觀察期狀態。
+
+## 最後驗證（P2.8，2026-10-16）
+
+| 命令 | 結果 | 退出碼 |
+|---|---|---:|
+| `python -m pytest -q` | **362 passed**（上階段 303，本階段 +59） | **0** |
+| `python -m twstock.cli datacheck` | 新增雙涵蓋區間、每日新增 vs 發布、來源與關聯覆蓋率 | **0** |
+| `python -m twstock.cli research` | 前瞻研究紀錄與觀察期狀態 | **0** |
+| `python -m twstock.cli validate` | 既有驗證未受影響 | **0** |
+| `python -m twstock.cli status` / `health` | — | **0** |
+| `python -m compileall -q -f twstock tests` | 全部編譯成功 | **0** |
+| 真實 DB 完整性（完整 `pytest` 前後） | 不變（見 STATUS_REPORT.md） | — |
+
+**禁止事項遵守**：未修改因子權重／曝險／持有期間／交易規則；未真實下單；
+未購買資料服務；未部署至 Vercel／Cloudflare；不宣稱策略具備可交易優勢。
+
+---
+
+## 上一輪 commit（P2.7，2026-10-15，已 push 至 `origin/main`）
 
 起始 HEAD = `47fcec8`；結束 HEAD 見文末。無 force push、未覆蓋任何未提交修改。
 

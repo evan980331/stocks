@@ -30,6 +30,7 @@ python -m twstock.cli run         :: 特徵 + 規則打分（+ 可選 ML）
 python -m twstock.cli backtest    :: 回測（含交易成本與基準比較）
 python -m twstock.cli validate    :: 樣本外驗證 + 成本敏感度（產出完整報告）
 python -m twstock.cli datacheck   :: 資料擷取狀態 + 新聞品質（不連網、不改資料）
+python -m twstock.cli research    :: 前瞻研究紀錄：凍結版本、每日切點、觀察期狀態
 python -m twstock.cli notify      :: Telegram 通知（可選）
 ```
 
@@ -87,7 +88,8 @@ C 固定權重 / D 可用性閘門）加一個分解控制組 A\*，並驗證**�
 ### 資料品質與擷取狀態（這批資料可不可信？）
 
 ```bat
-python -m twstock.cli datacheck      :: 新聞筆數／情緒覆蓋率／抓取成功率與失敗率
+python -m twstock.cli datacheck      :: 每日新增 vs 發布／雙涵蓋區間／情緒覆蓋率／來源與關聯覆蓋率
+python -m twstock.cli research       :: status（預設）｜freeze（凍結版本）｜cutoff（記錄今日切點）
 python -m twstock.cli health         :: 含最近一輪各資料集的擷取狀態
 ```
 
