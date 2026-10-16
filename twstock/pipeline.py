@@ -19,7 +19,7 @@ import pandas as pd
 from . import features as feat_mod
 from .config import CONFIG, REPORTS_DIR
 from .data import finmind_client as fm
-from .data import loader, store
+from .data import loader, pointintime, store
 from .data import status as st
 from .data.quality import build_corporate_actions, clean_prices
 from .sentiment import sentiment as sent
@@ -417,12 +417,18 @@ def load_panel(stats: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """組合價量 + 籌碼 + 新聞日分數 → features 面板。回傳 (panel, news)。
 
     價格使用**已還原**序列，避免除權息缺口被當成真實下跌。
+
+    新聞採 **point-in-time** 可用性（P2.8）：``date`` 取
+    ``max(published, fetched_at)``，並排除舊資料（``fetched_at`` 為 NULL
+    或 ``provenance='unknown'`）。這樣一則發布於 D、但在 D 之後才抓到的
+    新聞就不會被回填到 D 及其衰減窗口，避免前視偏差。代價是：
+    歷史面板中舊新聞不再有 ``news_sentiment``（詳見 docs/STATUS_REPORT.md）。
     """
     price = loader.load_price_panel(adjusted=True, stats=stats)
     inst = store.read_sql("SELECT * FROM institution")
     margin = store.read_sql("SELECT * FROM margin")
     rev = store.read_sql("SELECT * FROM revenue")
-    news = store.read_sql("SELECT published as date, stock_id, score FROM news")
+    news = pointintime.news_daily_for_signals()
 
     feature_rows: list[pd.DataFrame] = []
     for sid in CONFIG.pool:

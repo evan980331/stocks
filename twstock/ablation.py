@@ -1290,6 +1290,16 @@ def _notes(rep: AblationReport, split, horizons) -> list[str]:
         "結論僅適用於目前 20 檔多頭樣本（約 2 年），"
         "且新聞資料只涵蓋樣本最末端極少數交易日。",
     ]
+    # P2.8 引入 point-in-time 新聞可用性後，舊新聞（fetched_at 不可得）
+    # 不再進入面板。B17 報告是凍結的研究產物，其數字是在**過時面板**上算出的；
+    # 此處明確告知重跑不再重現，避免把差異誤讀成新發現。
+    if rep.n_rows_record == 0 and rep.news_rows:
+        notes.append(
+            f"⚠️ **point-in-time 新聞可用性（P2.8）已生效**：本面板中"
+            f"可進入訊號的新聞列 = 0（既有 {rep.news_rows} 則皆為"
+            "舊資料，抓取時點不可重建，依 §5.5 排除）。"
+            "docs/ABLATION_B17.md 的數字是在 P2.8 之前的面板上算出，"
+            "重跑本指令**不會**重現該報告；兩者不可直接比較。")
     return notes
 
 

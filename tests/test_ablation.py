@@ -383,3 +383,36 @@ def test_variant_frame_keys_are_unique_for_forward_return_merge():
     dup = f.duplicated(subset=["date", "stock_id"]).sum()
     assert dup == 0
     assert len(f) == 3
+
+
+# ==========================================================================
+# P2.8：point-in-time 新聞可用性生效後，凍結報告的可重現性必須明確告知
+# ==========================================================================
+def _report(news_rows: int, n_rows_record: int) -> "AblationReport":
+    from twstock.ablation import AblationReport
+    rep = AblationReport(generated_at="2026-10-15T00:00:00")
+    rep.news_rows = news_rows
+    rep.n_rows_record = n_rows_record
+    return rep
+
+
+def test_notes_flag_frozen_report_not_reproducible_under_pointintime():
+    """可進入訊號的新聞為 0 但 news 表有列 → 必須告知 B17 報告不可重現。
+
+    B17 是凍結研究產物，其數字算在 P2.8 之前的面板上；若不提醒，
+    重跑得出的不同數字會被誤讀成新發現。
+    """
+    from twstock.ablation import _notes
+    notes = "\n".join(_notes(_report(news_rows=237, n_rows_record=0),
+                             split=None, horizons=()))
+    assert "point-in-time" in notes
+    assert "不會**重現" in notes or "不會" in notes
+    assert "237" in notes
+
+
+def test_notes_do_not_claim_irreproducibility_when_news_is_usable():
+    """有可用新聞列時不得誤報不可重現（否則提醒會失去意義）。"""
+    from twstock.ablation import _notes
+    notes = "\n".join(_notes(_report(news_rows=237, n_rows_record=61),
+                             split=None, horizons=()))
+    assert "point-in-time" not in notes
