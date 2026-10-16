@@ -112,6 +112,25 @@ CREATE TABLE IF NOT EXISTS ingest_run (
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY, value TEXT
 );
+-- P2.8 §6：每日可稽核的研究時間切點。
+-- 以 cutoff_date 為主鍵並採「首次寫入即定案」：重跑不得改寫「當初知道什麼」，
+-- 否則時間切點就失去稽核意義（事後回填會偽造可稽核性）。
+CREATE TABLE IF NOT EXISTS research_cutoff (
+    cutoff_date TEXT PRIMARY KEY,
+    recorded_at TEXT,          -- 實際寫入此切點的時間（不得晚於事後被當成當時）
+    spec_hash TEXT,            -- 當時凍結的研究版本
+    code_sha TEXT,
+    price_min TEXT, price_max TEXT,
+    n_price_rows INTEGER, n_price_stocks INTEGER,
+    n_news_published_upto INTEGER,   -- 發布時間 <= cutoff 的新聞列
+    n_news_fetched_upto INTEGER,     -- 取得時間 <= cutoff 的新聞列（point-in-time 可見）
+    n_news_untraceable INTEGER,
+    n_news_fetched_unknown INTEGER,
+    last_run_id TEXT,
+    n_ingest_records INTEGER, n_ingest_failed INTEGER,
+    signals_digest TEXT,       -- cutoff 之前訊號列的內容摘要（偵測歷史訊號被改寫）
+    notes TEXT
+);
 """
 
 # 各表用於去重的主鍵（與 SCHEMA 一致）
@@ -127,6 +146,7 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "ingest_log": ("run_at", "stock_id", "dataset"),
     "ingest_run": ("run_id", "dataset", "stock_id"),
     "meta": ("key",),
+    "research_cutoff": ("cutoff_date",),
 }
 
 # 舊資料無法追溯的標記值（與 twstock.data.status 一致；此處不 import 以避免循環）

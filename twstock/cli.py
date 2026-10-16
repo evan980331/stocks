@@ -25,7 +25,8 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 DATA_CMDS = ["ingest", "run", "backtest", "validate", "notify", "dashboard",
-             "train", "all", "experts", "ai", "advice", "datacheck"]
+             "train", "all", "experts", "ai", "advice", "datacheck",
+             "research"]
 OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
 
 
@@ -108,6 +109,11 @@ def main() -> int:
         # 資料擷取狀態與新聞品質（只描述可信度，不產生任何績效結論）
         from .data import report
         print(report.build_report_text())
+
+    if args.cmd == "research":
+        # P2.8 §6：前瞻研究紀錄（凍結版本、時間切點、觀察期狀態）
+        from . import research
+        return research.main([args.name] if args.name else [])
 
     if args.cmd == "validate":
         # 樣本外驗證（P2.1）：時間序列切分 + 基準檢查 + 策略比較 + 成本敏感度
