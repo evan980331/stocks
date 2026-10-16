@@ -853,7 +853,8 @@ class DiagnosticsReport:
         L.append("[11] 結論限制")
         L.append("  - IC 只衡量「同期横斷面排序與未來報酬的關聯」，**不證明因果**，"
                  "也不保證可交易。")
-        L.append("  - 期間僅約 2 年且為單一多頭市況；IC 在此期間為正不代表其他市況成立。")
+        L.append("  - 期間僅約 2 年；IC 在此期間為正不代表其他市況成立"
+                 "（空頭期間的 IC 另見 P2.9 壓力測試：python -m twstock.cli stress）。")
         L.append("  - 股票池為寫死的 20 檔大型權值股，存在 survivorship bias，"
                  "不代表整個台股市場。")
         L.append("  - 本報告**不挑選最佳參數**，也不宣稱任何策略具備獲利能力。")
@@ -998,7 +999,8 @@ def run_diagnostics(*, horizons: tuple[int, ...] = HORIZONS,
         "與多重檢定校正均完整揭露。",
         f"多重檢定：同時檢定 {bh['n_tested']} 個（訊號 × 持有期間）假設，"
         f"未校正 {n_raw} 個看似顯著、BH 校正後 {bh['n_rejected']} 個。",
-        "⚠️ 樣本僅約 2 年且屬單一多頭市況，IC 在此期間的表現不保證其他市況成立。",
+        "⚠️ 樣本僅約 2 年，IC 在此期間的表現不保證其他市況成立"
+        "（空頭期間的 IC 另見 P2.9 壓力測試：python -m twstock.cli stress）。",
         "⚠️ 股票池為寫死的 20 檔大型權值股，未含歷史成分與下市股 → survivorship bias。",
         "⚠️ 月營收以『公告日』近似，非精確 point-in-time；法人與融資券為當日公布，"
         "但未驗證實際公告時間戳。",

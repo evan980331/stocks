@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -325,6 +326,8 @@ class ValidationReport:
     test_guard_violations: list[str] = field(default_factory=list)
     data_notes: list[str] = field(default_factory=list)
     fusion_available: bool = False
+    # 基準在整個樣本期間自高點的最大回撤（由實測算出，不用「單一市況」的假設）
+    benchmark_max_drawdown: float = float("nan")
 
     # ---- 報告輸出 ----
     def to_text(self) -> str:
@@ -427,8 +430,14 @@ class ValidationReport:
                  "結果僅適用於此樣本。")
         L.append("  - 價格已套用分割與現金股利還原；與價格序列不符而捨棄的事件採"
                  "保守處理（略微低估報酬）。")
-        L.append("  - 樣本期間僅約 2 年且屬單一市況（多頭），未涵蓋空頭與高波動"
-                 "期間，穩健性無法確認。")
+        if math.isfinite(self.benchmark_max_drawdown):
+            L.append(f"  - 樣本期間約 2 年；{CONFIG.benchmark} 期間內自高點最大回撤 "
+                     f"{self.benchmark_max_drawdown:.2%} → **已含空頭事件**，"
+                     "但本報告的等分切段不足以回答抗跌能力；"
+                     "逆境表現請以 `python -m twstock.cli stress` 為準。")
+        else:
+            L.append("  - 樣本期間僅約 2 年；未取得基準回撤量測，"
+                     "無法判定是否涵蓋空頭期間。")
         L.append("=" * 78)
         return "\n".join(L)
 
@@ -602,8 +611,21 @@ def run_validation(*, strategies: list[StrategySpec] | None = None,
     if len(dates) < 252 * 2:
         notes.append(f"⚠️ 樣本期間僅 {len(dates) / 252:.2f} 年，"
                      "不足以評估長期穩定性。")
-    notes.append("⚠️ 樣本僅涵蓋單一市況（本期間大盤為上漲走勢），"
-                 "未包含空頭／高波動期間，無法確認策略在逆境的表現。")
+    bench_dd = float("nan")
+    if benchmark is not None and not benchmark.empty:
+        bclose = pd.to_numeric(benchmark["close"], errors="coerce").dropna()
+        if len(bclose) > 1:
+            b = bclose.to_numpy(dtype=float)
+            bench_dd = float((b / np.maximum.accumulate(b) - 1.0).min())
+    if math.isfinite(bench_dd) and bench_dd <= -0.10:
+        notes.append(
+            f"⚠️ 本期間大盤為淨上漲，但**並非單一市況**：{CONFIG.benchmark} 期間內"
+            f"自高點最大回撤 {bench_dd:.2%}，已包含空頭事件；"
+            "本報告的等分切段不足以回答抗跌能力，"
+            "逆境表現請以 `python -m twstock.cli stress`（P2.9）為準。")
+    else:
+        notes.append(f"⚠️ 未能量測 {CONFIG.benchmark} 期間回撤或未達 10%，"
+                     "無法確認樣本是否涵蓋空頭／高波動期間。")
     notes.append("參數選擇僅在 train/valid 上進行；test 只用於最終評估一次；"
                  "報告中的變體比較不得回過頭用來挑選最佳參數。")
     if split.test.n_dates < MIN_TEST_DAYS:
@@ -620,7 +642,7 @@ def run_validation(*, strategies: list[StrategySpec] | None = None,
         cost_rows=cost_rows, periods=periods,
         strategy_benchmark_available=bench_status.ok,
         test_guard_violations=guard.violations, data_notes=notes,
-        fusion_available=False)
+        fusion_available=False, benchmark_max_drawdown=bench_dd)
 
 
 def main(argv: list[str] | None = None) -> int:

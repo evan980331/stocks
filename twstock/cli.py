@@ -3,6 +3,7 @@
 資料/分析：
   ingest | run | backtest | train | notify | experts | ai
   validate（樣本外驗證） | datacheck（資料品質與擷取狀態）
+  research（前瞻研究紀錄） | stress（空頭市況壓力測試）
 
 本地服務生命週期：
   dashboard（前景） | worker（前景）
@@ -12,6 +13,7 @@
   python -m twstock.cli ingest
   python -m twstock.cli run
   python -m twstock.cli datacheck
+  python -m twstock.cli stress
   python -m twstock.cli start worker
   python -m twstock.cli health
 """
@@ -26,7 +28,7 @@ logging.basicConfig(level=logging.INFO,
 
 DATA_CMDS = ["ingest", "run", "backtest", "validate", "notify", "dashboard",
              "train", "all", "experts", "ai", "advice", "datacheck",
-             "research"]
+             "research", "stress"]
 OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
 
 
@@ -114,6 +116,11 @@ def main() -> int:
         # P2.8 §6：前瞻研究紀錄（凍結版本、時間切點、觀察期狀態）
         from . import research
         return research.main([args.name] if args.name else [])
+
+    if args.cmd == "stress":
+        # P2.9：空頭市況壓力測試（期間辨識、基準比較、訊號檢驗）
+        from . import stress
+        return stress.main([])
 
     if args.cmd == "validate":
         # 樣本外驗證（P2.1）：時間序列切分 + 基準檢查 + 策略比較 + 成本敏感度
