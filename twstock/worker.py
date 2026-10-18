@@ -38,6 +38,11 @@ DEFAULT_TASK_TIMEOUT = 3600     # 任務逾時門檻（秒）
 DEFAULT_MAX_FAILURES = 3        # 連續失敗達此次數 → task_failed
 DATA_STALE_DAYS = 3             # 行情延遲超過此天數 → data_stale
 
+# ---- P3：盤中行情輪詢（可選、非致命、預設完全不做）----
+QUOTE_SOURCE_ENV = "TWSTOCK_QUOTE_SOURCE"
+QUOTE_INTERVAL_S = 60           # 建議輪詢間隔（仍受來源限流）
+QUOTE_MAX_AGE_S = 300           # 行情有效年齡門檻（秒）
+
 T = TypeVar("T")
 
 
@@ -313,6 +318,96 @@ def _compute_data_staleness() -> int | None:
         return None
 
 
+# --------------------------------------------------------------------------
+# P3：盤中行情輪詢（完全獨立於 EOD 流程，失敗**不得**影響 ingest/打分）
+# --------------------------------------------------------------------------
+def quote_poll_enabled() -> bool:
+    """是否啟用行情輪詢：未設定來源就**完全不動作**。
+
+    刻意不自行選一個預設來源：那會在使用者不知情的情況下對外部服務
+    發送請求，也可能觸發來源條款問題。
+    """
+    return bool((os.environ.get(QUOTE_SOURCE_ENV) or "").strip())
+
+
+def quote_poll_due(heartbeat: dict | None, *, now: dt.datetime | None = None,
+                   interval: int = QUOTE_INTERVAL_S) -> bool:
+    """距離上次輪詢是否已達間隔（純函式，可完整測試）。"""
+    now = now or dt.datetime.now()
+    hb = heartbeat or {}
+    last = hb.get("quote_polled_at")
+    if not last:
+        return True
+    try:
+        last_dt = dt.datetime.fromisoformat(str(last))
+    except (TypeError, ValueError):
+        return True
+    return (now - last_dt).total_seconds() >= max(1, int(interval))
+
+
+def run_quote_cycle(*, force: bool = False, now: dt.datetime | None = None,
+                    source: str | None = None,
+                    max_age_s: float = QUOTE_MAX_AGE_S,
+                    poller: Callable[..., Any] | None = None) -> dict:
+    """執行一次行情輪詢並更新心跳。**絕不呼叫 run_scores**。
+
+    安全規則
+      - 未設定來源 → 不抓取，只記下「未設定」（不假裝成功）。
+      - 非交易時段且未 force → 不抓取。
+      - 來源失敗 → 心跳標為 failed；**不碰價量、不產生新訊號**。
+      - 任何例外都不往外拋到 EOD 流程（行情失敗不得讓整輪失敗）。
+    """
+    from .data import quotes
+
+    now = now or dt.datetime.now()
+    if source is None and not quote_poll_enabled():
+        res = {"status": "not_configured",
+               "reason": f"未設定 {QUOTE_SOURCE_ENV}"}
+        write_heartbeat(quote_polled_at=now.isoformat(timespec="seconds"),
+                        quote_health=quotes.SourceHealth.UNKNOWN.value,
+                        quote_health_label=quotes.SourceHealth.UNKNOWN.label,
+                        quote_reason=res["reason"])
+        return res
+    sess = quotes.session_state(now)
+    if not force and sess in (quotes.SessionState.CLOSED,
+                              quotes.SessionState.WEEKEND):
+        res = {"status": "skipped", "reason": f"非交易時段（{sess.label}）",
+               "session": sess.value}
+        write_heartbeat(quote_polled_at=now.isoformat(timespec="seconds"),
+                        quote_session=sess.value,
+                        quote_reason=res["reason"])
+        return res
+    try:
+        poll_fn = poller or quotes.poll_once
+        res_poll = poll_fn(source=quotes.resolve_source(source), now=now,
+                           run_id=st_run_id(now), max_age_s=max_age_s)
+    except Exception as e:  # noqa: BLE001
+        log.warning("行情輪詢失敗（不影響 EOD 流程）：%s", e)
+        write_heartbeat(quote_polled_at=now.isoformat(timespec="seconds"),
+                        quote_health=quotes.SourceHealth.FAILED.value,
+                        quote_health_label=quotes.SourceHealth.FAILED.label,
+                        quote_reason=f"{type(e).__name__}: {e}")
+        return {"status": "failed", "reason": str(e)}
+    hb = res_poll.health.as_heartbeat() if res_poll.health else {}
+    hb["quote_polled_at"] = now.isoformat(timespec="seconds")
+    hb["quote_result"] = res_poll.label()
+    if res_poll.skipped_reason:
+        hb["quote_reason"] = res_poll.skipped_reason
+    write_heartbeat(**hb)
+    try:
+        quotes.write_poll_records(res_poll)
+    except Exception as e:  # noqa: BLE001
+        log.warning("行情輪詢紀錄寫入失敗：%s", e)
+    return {"status": "polled", "result": res_poll,
+            "health": hb.get("quote_health", "")}
+
+
+def st_run_id(now: dt.datetime | None = None) -> str:
+    """行情輪詢用的可排序 run_id（前綴 q 以便與 ingest 區分）。"""
+    now = now or dt.datetime.now()
+    return "q" + now.strftime("%Y%m%dT%H%M%S")
+
+
 def run_cycle(force: bool = False) -> str:
     """執行一輪：判斷是否需要更新 → ingest → 打分。回傳狀態字串。
 
@@ -397,6 +492,9 @@ def run_forever(name: str = "worker", interval: int = 1800,
                 last_result=outcome.label(),
                 failure_reason="" if outcome.ok else outcome.error,
                 task_started_at=None, last_run=_today())
+            if quote_poll_enabled():
+                # 行情輪詢為獨立、非致命的一步：失敗不得改變 EOD 的成敗
+                run_quote_cycle()
             return 0 if outcome.ok else 3
 
         failures = 0
@@ -420,6 +518,9 @@ def run_forever(name: str = "worker", interval: int = 1800,
             while slept < interval and not stop_requested(name):
                 time.sleep(SLEEP_CHUNK)
                 slept += SLEEP_CHUNK
+                # P3：盤中行情輪詢（未設定來源／非交易時段／未到間隔則完全不動作）
+                if quote_poll_enabled() and quote_poll_due(read_heartbeat()):
+                    run_quote_cycle()
     finally:
         write_heartbeat(status="stopped", task_started_at=None)
         clear_stop(name)

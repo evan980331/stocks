@@ -4,6 +4,7 @@
   ingest | run | backtest | train | notify | experts | ai
   validate（樣本外驗證） | datacheck（資料品質與擷取狀態）
   research（前瞻研究紀錄） | stress（空頭市況壓力測試）
+  quotes（行情來源介面與健康狀態；子指令 status|poll|selftest|catalog）
 
 本地服務生命週期：
   dashboard（前景） | worker（前景）
@@ -14,6 +15,8 @@
   python -m twstock.cli run
   python -m twstock.cli datacheck
   python -m twstock.cli stress
+  python -m twstock.cli quotes
+  python -m twstock.cli quotes selftest
   python -m twstock.cli start worker
   python -m twstock.cli health
 """
@@ -28,7 +31,7 @@ logging.basicConfig(level=logging.INFO,
 
 DATA_CMDS = ["ingest", "run", "backtest", "validate", "notify", "dashboard",
              "train", "all", "experts", "ai", "advice", "datacheck",
-             "research", "stress"]
+             "research", "stress", "quotes"]
 OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
 
 
@@ -45,7 +48,18 @@ def main() -> int:
     ap.add_argument("--interval", type=int, default=1800,
                     help="Worker 每輪間隔秒數")
     ap.add_argument("--once", action="store_true", help="Worker 只執行一次")
+    ap.add_argument("--at", default=None,
+                    help="quotes selftest 的時間基準（ISO；僅供離線自檢）")
     args = ap.parse_args()
+
+    # argparse 的 nargs="*" 會把後續的 --at 一併吃進 --stocks，
+    # 因此在此截斷（不含任何股票代碼以大寫 -- 開頭）。
+    stocks = []
+    for tok in (args.stocks or []):
+        if tok.startswith("--"):
+            break
+        stocks.append(tok)
+    args.stocks = stocks
 
     # ---- 服務生命週期 ----
     if args.cmd == "start":
@@ -121,6 +135,16 @@ def main() -> int:
         # P2.9：空頭市況壓力測試（期間辨識、基準比較、訊號檢驗）
         from . import stress
         return stress.main([])
+
+    if args.cmd == "quotes":
+        # P3：行情來源介面、健康狀態與（選用的）實際輪詢
+        from .data import quotes
+        sub = [args.name] if args.name else []
+        if args.stocks:
+            sub += ["--stocks", *args.stocks]
+        if args.at:
+            sub += ["--at", args.at]
+        return quotes.main(sub)
 
     if args.cmd == "validate":
         # 樣本外驗證（P2.1）：時間序列切分 + 基準檢查 + 策略比較 + 成本敏感度

@@ -112,6 +112,22 @@ CREATE TABLE IF NOT EXISTS ingest_run (
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY, value TEXT
 );
+-- P3：行情快照帳本（每個來源／種類各留一份，主鍵即幂等去重鍵）。
+-- market_time 為**正規化 ISO**（僅用於排序與去重）；來源原樣字串另存
+-- market_time_raw，兩者不得互相冒充。market_time_source 記「時間從何而來」：
+-- source（來源提供）／derived（可驗證推導）／unknown（不可得，不得當成新行情）。
+CREATE TABLE IF NOT EXISTS quote (
+    source TEXT, kind TEXT, stock_id TEXT,
+    market_time TEXT, market_time_raw TEXT, market_time_source TEXT,
+    fetched_at TEXT,
+    price REAL, prev_close REAL, open REAL, high REAL, low REAL,
+    last_volume REAL, total_volume REAL, bid REAL, ask REAL,
+    market_state TEXT, status TEXT,
+    error_class TEXT, error TEXT, run_id TEXT, notes TEXT,
+    PRIMARY KEY (source, kind, stock_id, market_time)
+);
+CREATE INDEX IF NOT EXISTS idx_quote_stock ON quote(stock_id, market_time);
+CREATE INDEX IF NOT EXISTS idx_quote_fetched ON quote(fetched_at);
 -- P2.8 §6：每日可稽核的研究時間切點。
 -- 以 cutoff_date 為主鍵並採「首次寫入即定案」：重跑不得改寫「當初知道什麼」，
 -- 否則時間切點就失去稽核意義（事後回填會偽造可稽核性）。
@@ -147,6 +163,7 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "ingest_run": ("run_id", "dataset", "stock_id"),
     "meta": ("key",),
     "research_cutoff": ("cutoff_date",),
+    "quote": ("source", "kind", "stock_id", "market_time"),
 }
 
 # 舊資料無法追溯的標記值（與 twstock.data.status 一致；此處不 import 以避免循環）

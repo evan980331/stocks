@@ -1,2 +1,2 @@
-from . import (finmind_client, loader, pointintime, quality, report, status,
-               store)  # noqa: F401
+from . import (finmind_client, loader, pointintime, quality, quotes, report,
+               status, store)  # noqa: F401
