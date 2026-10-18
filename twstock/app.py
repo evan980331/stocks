@@ -324,3 +324,107 @@ def api_experts(limit: int = 15) -> dict:
     if df.empty:
         return {"items": [], "hint": "尚無資料，本機執行: python -m twstock.cli experts"}
     return {"items": df.to_dict(orient="records"), "hint": ""}
+
+
+# ---------------------------------------------------------------------------
+# P4：模擬交易（paper）唯讀 API。所有端點僅查詢、不建立訂單、不成交；
+# 下單與成交只在本機 CLI（python -m twstock.cli paper …）。
+# ---------------------------------------------------------------------------
+_PAPER_HINT = "尚未建立 paper 帳戶，本機執行：python -m twstock.cli paper init"
+
+
+def _paper_records(df) -> list:
+    """DataFrame → JSON 安全 records（NULL → None，避免 NaN 序列化 500）。"""
+    if df is None or df.empty:
+        return []
+    clean = df.astype(object).where(df.notna(), None)
+    return jsonable_encoder(clean.to_dict(orient="records"))
+
+
+@app.get("/api/paper/account")
+def api_paper_account() -> dict:
+    """紙上帳戶總覽（唯讀）；含帳務一致性。"""
+    from .paper import PaperEngine, PaperError
+    eng = PaperEngine()
+    try:
+        acc = eng.account()
+        if acc is None:
+            return {"error": _PAPER_HINT}
+        return {"summary": eng.account_text(),
+                "reconcile": eng.reconcile()}
+    except (PaperError, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/paper/positions")
+def api_paper_positions() -> dict:
+    from .paper import PaperEngine, PaperError
+    eng = PaperEngine()
+    try:
+        if eng.account() is None:
+            return {"error": _PAPER_HINT}
+        df = eng.positions_view()
+        return {"items": _paper_records(df)}
+    except (PaperError, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/paper/orders")
+def api_paper_orders(status: str | None = None, limit: int = 50) -> dict:
+    from .paper import PaperEngine, PaperError
+    eng = PaperEngine()
+    try:
+        if eng.account() is None:
+            return {"error": _PAPER_HINT}
+        df = eng.orders_view(status=status, limit=limit)
+        return {"items": _paper_records(df)}
+    except (PaperError, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/paper/fills")
+def api_paper_fills(limit: int = 50) -> dict:
+    from .paper import PaperEngine, PaperError
+    eng = PaperEngine()
+    try:
+        if eng.account() is None:
+            return {"error": _PAPER_HINT}
+        df = eng.fills_view(limit=limit)
+        return {"items": _paper_records(df)}
+    except (PaperError, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/paper/ledger")
+def api_paper_ledger(limit: int = 50) -> dict:
+    from .paper import PaperEngine, PaperError
+    eng = PaperEngine()
+    try:
+        if eng.account() is None:
+            return {"error": _PAPER_HINT}
+        df = eng.ledger_view(limit=limit)
+        return {"items": _paper_records(df)}
+    except (PaperError, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/paper/risk")
+def api_paper_risk() -> dict:
+    """風控狀態（唯讀；含 kill switch 與拒絕原因）。"""
+    from .paper import PaperEngine, PaperError
+    eng = PaperEngine()
+    try:
+        return eng.risk_status()
+    except (PaperError, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/paper/reconcile")
+def api_paper_reconcile() -> dict:
+    """帳務一致性核對（唯讀；帳本重建 vs 帳戶/持倉/成交）。"""
+    from .paper import PaperEngine, PaperError
+    eng = PaperEngine()
+    try:
+        return eng.reconcile()
+    except (PaperError, RuntimeError) as e:
+        return {"error": str(e)}

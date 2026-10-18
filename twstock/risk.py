@@ -115,30 +115,41 @@ class AccountState:
     now: dt.datetime | None = None
 
 
-def preflight(state: AccountState) -> RiskDecision:
-    """強制停止條件（與單筆委託無關的全域檢查）。"""
+def preflight(state: AccountState, *,
+              limits: RiskLimits | None = None) -> RiskDecision:
+    """強制停止條件（與單筆委託無關的全域檢查）。
+
+    ``limits`` 為 P4 擴充：預設仍使用 ``DEFAULT_LIMITS``（既有行為不變），
+    模擬交易引擎可傳入自己的限制實例。未傳入時語意與舊版完全一致。
+    """
+    lim = limits or DEFAULT_LIMITS
     reasons: list[str] = []
     if state.equity <= 0:
         reasons.append("可用資金無法確認（equity<=0）")
     if not state.realized_position_reconciles:
         reasons.append("本地持倉與券商實際持倉不一致")
-    if state.data_staleness_days > DEFAULT_LIMITS.max_data_staleness_days:
+    if state.data_staleness_days > lim.max_data_staleness_days:
         reasons.append(f"行情過期（{state.data_staleness_days} 天）")
-    if state.day_pnl_pct <= -DEFAULT_LIMITS.max_daily_loss_pct:
+    if state.day_pnl_pct <= -lim.max_daily_loss_pct:
         reasons.append("觸發單日損失上限")
-    if state.drawdown_pct <= -DEFAULT_LIMITS.max_drawdown_pct:
+    if state.drawdown_pct <= -lim.max_drawdown_pct:
         reasons.append("觸發最大回撤限制")
-    if state.open_orders >= DEFAULT_LIMITS.max_open_orders:
+    if state.open_orders >= lim.max_open_orders:
         reasons.append("未完成委託數達上限")
-    if state.orders_today >= DEFAULT_LIMITS.max_orders_per_day:
+    if state.orders_today >= lim.max_orders_per_day:
         reasons.append("單日委託數達上限")
     return RiskDecision(not reasons, reasons)
 
 
 def check_order(state: AccountState, *, stock_id: str, price: float, qty: int,
-                side: str = "BUY") -> RiskDecision:
-    """單筆委託檢查。任何一項不通過即不得送出。"""
-    reasons = list(preflight(state).reasons)
+                side: str = "BUY",
+                limits: RiskLimits | None = None) -> RiskDecision:
+    """單筆委託檢查。任何一項不通過即不得送出。
+
+    ``limits`` 為 P4 擴充（預設 ``DEFAULT_LIMITS``，既有呼叫端不受影響）。
+    """
+    lim = limits or DEFAULT_LIMITS
+    reasons = list(preflight(state, limits=lim).reasons)
 
     if not live_enabled() and current_mode() is Mode.LIVE:
         reasons.append("live 模式缺少人工確認旗標（TWSTOCK_LIVE_ACK）")
@@ -146,17 +157,17 @@ def check_order(state: AccountState, *, stock_id: str, price: float, qty: int,
         reasons.append("委託數量或價格不合法")
 
     value = price * qty
-    if value > DEFAULT_LIMITS.max_order_value:
-        reasons.append(f"單筆金額 {value:,.0f} 超過上限 {DEFAULT_LIMITS.max_order_value:,.0f}")
+    if value > lim.max_order_value:
+        reasons.append(f"單筆金額 {value:,.0f} 超過上限 {lim.max_order_value:,.0f}")
 
     if side.upper() == "BUY":
         held = state.position_value_by_stock.get(stock_id, 0.0)
-        if held + value > state.equity * DEFAULT_LIMITS.max_position_pct:
+        if held + value > state.equity * lim.max_position_pct:
             reasons.append("超過單一股票部位上限")
         gross = sum(state.position_value_by_stock.values()) + value
-        if gross > state.equity * DEFAULT_LIMITS.max_gross_exposure:
+        if gross > state.equity * lim.max_gross_exposure:
             reasons.append("超過整體持倉上限")
-        if state.liquidity_20d_value and state.liquidity_20d_value < DEFAULT_LIMITS.min_liquidity_value:
+        if state.liquidity_20d_value and state.liquidity_20d_value < lim.min_liquidity_value:
             reasons.append("流動性不足")
 
     return RiskDecision(not reasons, reasons)

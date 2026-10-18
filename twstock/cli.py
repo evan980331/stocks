@@ -5,6 +5,8 @@
   validate（樣本外驗證） | datacheck（資料品質與擷取狀態）
   research（前瞻研究紀錄） | stress（空頭市況壓力測試）
   quotes（行情來源介面與健康狀態；子指令 status|poll|selftest|catalog）
+  paper（P4 模擬交易；子指令 init|account|orders|fills|positions|ledger|
+         cycle|risk|reconcile|recover|kill|resume —— 純模擬，不下真單）
 
 本地服務生命週期：
   dashboard（前景） | worker（前景）
@@ -31,7 +33,7 @@ logging.basicConfig(level=logging.INFO,
 
 DATA_CMDS = ["ingest", "run", "backtest", "validate", "notify", "dashboard",
              "train", "all", "experts", "ai", "advice", "datacheck",
-             "research", "stress", "quotes"]
+             "research", "stress", "quotes", "paper"]
 OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
 
 
@@ -50,6 +52,14 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="Worker 只執行一次")
     ap.add_argument("--at", default=None,
                     help="quotes selftest 的時間基準（ISO；僅供離線自檢）")
+    ap.add_argument("--cash", type=float, default=None,
+                    help="paper init 的初始虛擬資金（TWD）")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="paper orders/fills/ledger 顯示筆數")
+    ap.add_argument("--status", default=None,
+                    help="paper orders 的狀態過濾（如 accepted/filled）")
+    ap.add_argument("--reason", default=None,
+                    help="paper kill 的緊急停止原因")
     args = ap.parse_args()
 
     # argparse 的 nargs="*" 會把後續的 --at 一併吃進 --stocks，
@@ -107,6 +117,21 @@ def main() -> int:
     if args.cmd == "worker":
         from .worker import run_forever
         return run_forever(interval=args.interval, force_once=args.once)
+
+    if args.cmd == "paper":
+        # P4：模擬交易（paper；**純模擬、不下真單**）。
+        # 子指令與旗標轉交 twstock.paper.main（沿用既有 CLI 單層風格）。
+        from . import paper as paper_mod
+        sub = [args.name or "account"]
+        if args.cash is not None:
+            sub += ["--cash", str(args.cash)]
+        if args.limit is not None:
+            sub += ["--limit", str(args.limit)]
+        if args.status:
+            sub += ["--status", args.status]
+        if args.reason:
+            sub += ["--reason", args.reason]
+        return paper_mod.main(sub)
 
     # ---- 資料與分析 ----
     if args.cmd in ("ingest", "all"):

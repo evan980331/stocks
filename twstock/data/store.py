@@ -147,6 +147,73 @@ CREATE TABLE IF NOT EXISTS research_cutoff (
     signals_digest TEXT,       -- cutoff 之前訊號列的內容摘要（偵測歷史訊號被改寫）
     notes TEXT
 );
+
+-- P4：模擬交易（paper trading）專用表族群。
+-- **所有金額＝微元整數（ *_utwd，1 utwd = 10^-6 TWD）**；不使用浮點累積帳務。
+-- paper_* 表與研究資料（price/signals/quote…）完全分離：
+-- 分離帳本不可被回測結果覆寫，也不得把研究資料當交易帳本。
+CREATE TABLE IF NOT EXISTS paper_account (
+    account_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,          -- 帳戶名（預設 paper）
+    mode TEXT,                 -- paper（本專案僅模擬；不得為 live）
+    status TEXT,               -- active／closed
+    initial_cash_utwd INTEGER, cash_utwd INTEGER,
+    fee_scenario TEXT,         -- 使用的成交成本情境（可追溯）
+    created_at TEXT, notes TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_order (
+    order_id TEXT PRIMARY KEY,
+    account_id INTEGER, client_order_id TEXT,
+    stock_id TEXT, side TEXT, qty INTEGER,
+    order_type TEXT,           -- market（本期只支援整股市價委託）
+    status TEXT,               -- 生命週期見 paper.STATUS_TRANSITIONS
+    filled_qty INTEGER,
+    last_checked_date TEXT,   -- 最後嘗試成交的行情日（推進光標）
+    signal_date TEXT,          -- T 日：訊號計算基準日（防 look-ahead 稽核）
+    created_at TEXT, updated_at TEXT,
+    reason TEXT, reject_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_order_coid
+    ON paper_order(account_id, client_order_id);
+CREATE TABLE IF NOT EXISTS paper_fill (
+    fill_id TEXT PRIMARY KEY,  -- = order_id:fill_date（冪等重播防護）
+    account_id INTEGER, order_id TEXT,
+    stock_id TEXT, side TEXT, qty INTEGER, fill_date TEXT,
+    price_utwd INTEGER, raw_price_utwd INTEGER,
+    fee_utwd INTEGER, tax_utwd INTEGER,
+    order_type TEXT, price_source TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_position (
+    account_id INTEGER, stock_id TEXT,
+    qty INTEGER, cost_basis_utwd INTEGER,
+    avg_cost_share_utwd INTEGER, realized_utwd INTEGER, updated_at TEXT,
+    PRIMARY KEY (account_id, stock_id)
+);
+CREATE TABLE IF NOT EXISTS paper_ledger (
+    ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER, ts TEXT,
+    kind TEXT,                  -- capital／fill（本期）
+    amount_utwd INTEGER, balance_utwd INTEGER,
+    order_id TEXT, fill_id TEXT, stock_id TEXT, note TEXT,
+    ref TEXT                    -- 冪等鍵：同一事件重播不得重複記帳
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_ledger_ref
+    ON paper_ledger(account_id, ref);
+CREATE TABLE IF NOT EXISTS paper_snapshot (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER, as_of TEXT,
+    cash_utwd INTEGER, market_value_utwd INTEGER, equity_utwd INTEGER,
+    realized_utwd INTEGER, unrealized_utwd INTEGER,
+    max_equity_utwd INTEGER, drawdown_pct REAL,
+    market_date TEXT, note TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_event (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER, ts TEXT, kind TEXT, ref TEXT, data TEXT
+);
+-- 供 paper_snapshot（冪等快照：同一 as_of 重跑不重複）用
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_snapshot_asof
+    ON paper_snapshot(account_id, as_of);
 """
 
 # 各表用於去重的主鍵（與 SCHEMA 一致）
@@ -164,6 +231,14 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "meta": ("key",),
     "research_cutoff": ("cutoff_date",),
     "quote": ("source", "kind", "stock_id", "market_time"),
+    # paper_* 表族群（P4 模擬交易）；*_utwd 金額為微元整數
+    "paper_account": (),   # account_id AUTOINCREMENT；name 唯一
+    "paper_order": ("order_id",),
+    "paper_fill": ("fill_id",),
+    "paper_position": ("account_id", "stock_id"),
+    "paper_ledger": ("ledger_id",),
+    "paper_snapshot": ("snapshot_id",),
+    "paper_event": ("event_id",),
 }
 
 # 舊資料無法追溯的標記值（與 twstock.data.status 一致；此處不 import 以避免循環）
@@ -177,7 +252,12 @@ def _ensure_dir() -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    """開啟 DB。唯讀模式用 file: URI + mode=ro，且不建表。"""
+    """開啟 DB。唯讀模式用 file: URI + mode=ro，且不建表。
+
+    列取用 ``conn.execute(...).fetchone()``後以 ``row["col"]`` 取欄時，
+    需先 ``conn.row_factory = sqlite3.Row``（本專案預設 tuple；
+    需要具名欄位的呼叫端（如 paper engine）自行轉換）。
+    """
     if is_readonly():
         uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
         return sqlite3.connect(uri, uri=True)
