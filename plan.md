@@ -467,6 +467,27 @@ Kill Switch 只「禁止新增正式委託」，**不刪除交易紀錄、不自
   就會對使用者資料觸發遷移（實測時間戳 `2026-10-15T00:11:04`）。
   已改為 autouse 隔離，並實測確認跑完 `pytest` 後真實 DB 雜湊**不變**。
 
+### W26 — P4 模擬交易引擎 ✅ `DONE`（純模擬，不接券商、不進 P5）
+- **成果**：`twstock/paper.py`（新，約 1.5k 行：帳戶/訂單狀態機/T+1 成交
+  模擬/微元帳本/WAC 持倉/快照/reconcile/風控/CLI）、`store.py` `paper_*`
+  七張表（金額皆微元整數 `*_utwd`）、`cli paper` 子命令、`app.py` 七個
+  唯讀 API、`tests/test_paper.py`（23 項）、`docs/PAPER_TRADING.md`、
+  `risk.py` 向後相容擴充（`preflight/check_order` 可傳自訂 `limits`）。
+- **帳務閉環（可重播、可核對）**：現金事實＝帳本（有號事件＋餘額鏈）、
+  持倉事實＝成交序列重放（寫入與重播同公式）；訂單→成交→帳本→持倉
+  單一 DB 交易、失敗整筆回滾；`client_order_id`/`fill_id`/帳本 `ref`
+  三層唯一鍵防重播；`reconcile` 六項核對（現金/餘額鏈/成交金額/持倉
+  快取/訂單成交量/快照恆等式），不一致即報告且停止交易。
+- **時間正確性**：T 日訊號 → 成交用 **T+1（其後第一個交易日）開盤價**
+  ± 滑價（沿用回測約定，絕不用 T 日收盤價成交）；`signal_date` 入庫稽核；
+  收盤前不成交當日 bar；缺價/停牌/漲跌停/無量一律「不成交＋記原因」。
+- **風險在成交流程之前**：單筆/部位/現金/持倉/單日損失/回撤/行情過期/
+  Kill Switch（下單與成交雙重檢查）/盤前下單/live 模式九道閘；拒單也入庫。
+- **驗證**：`pytest -q` → **489 passed**（上階段 466，+23）；`compileall` 0；
+  `datacheck`/`validate`/`research`/`status`/`health` 退出碼皆 0
+  （`TWSTOCK_READONLY=1` 下實測）；**正式 DB sha256 於全套測試前後完全一致**
+  （`618b02ff…`）。
+
 ### W25 — P3 行情來源與資料管線 ✅ `DONE`（未接通真實盤中行情）
 - **成果**：`twstock/data/quotes.py`（新，統一行情介面）、`twstock/quotes.py`、
   `cli quotes`（status/poll/selftest/catalog）、`quote` 表（新 schema）、
@@ -564,9 +585,14 @@ python -m pytest -q
   市場時間與取得時間分離、延遲分類、斷線／限流／格式錯誤與有上限重試、
   交易時段判斷、過期不得通過訊號閘門、Worker 重啟與單實例保護、
   **正式 DB 安全（selftest 沙盒化）**與既有功能回歸（W25，74 項） |
+| `tests/test_paper.py` | 模擬交易 17 類：初始帳戶、買賣帳務、費率稅、WAC 成本損益、
+  拒單、重複防護、取消與狀態轉移、部分成交、行情過期/缺價/停牌/時點、
+  漲跌停、風控上限、緊急停止、重啟恢復、交易失敗回滾、帳本重建核對、
+  正式 DB 隔離、**無真實下單路徑（AST 掃描）**、CLI/API（W26，23 項） |
 
 **現況**：P0 基準 `14 passed` → 首輪修復後 **`55 passed`** → P2.7 後 **`303 passed`**
-→ P2.8 後 **`362 passed`** → P2.9 後 **`392 passed`** → P3 行情管線後 **`466 passed`**。
+→ P2.8 後 **`362 passed`** → P2.9 後 **`392 passed`** → P3 行情管線後 **`466 passed`**
+→ P4 模擬交易後 **`489 passed`**。
 
 實際執行項目與結果：
 
@@ -675,8 +701,10 @@ python -m pytest -q
    這是取得**新 test 段**的唯一途徑（現 test 已消耗）。
 4. **B19 接線**：把 `JobRunner` 接進 `worker.run_forever`，先只接 `ingest`。
 5. **B20 CI**：把 `pytest` 與重跑報告納入自動化。
-6. **P4**：模擬券商 + 委託狀態機（`risk.py` 已有檢查層）——但**只有在訊號
-   真的有樣本外優勢時才值得做**，否則只是把一個沒有優勢的策略自動化。
+6. **P4 模擬交易 ✅ 已完成（2026-10-19）**：委託狀態機、T+1 成交模擬、
+   微元帳本與 reconcile、風控九道閘、`cli paper` 與唯讀 API、23 項測試
+   （見 W26 與 `docs/PAPER_TRADING.md`）。**P5（盤中即時交易/券商連線）
+   未開始**：依停止條件不自動進入；且只有在訊號真的有樣本外優勢時才值得做。
 7. **B1 決策**：是否安裝 `lightgbm`/`scikit-learn`（需使用者決定）。
 8. **B23 累積已就緒、只差時間**：P2.8 已完成按日冪等累積、point-in-time 可用性、
    可稽核時間切點與最低觀察期間（120／建議 250 交易日）。
@@ -688,7 +716,31 @@ python -m pytest -q
 
 ---
 
-## 本輪 commit（P3 行情來源與資料管線，2026-10-18，已 push 至 `origin/main`）
+## 本輪 commit（P4 模擬交易引擎，2026-10-19，已 push 至 `origin/main`）
+
+| 順序 | 訊息 | 內容 |
+|---|---|---|
+| 1 | `feat(paper): P4 模擬交易引擎（帳務閉環/T+1 成交/風控/CLI/API）` | twstock/paper.py（新）、store.py（paper_* 表）、cli.py、app.py、risk.py（limits 參數）、tests/test_paper.py（23 項，全套 489 passed） |
+| 2 | （本文件所在 commit） | docs/PAPER_TRADING.md、plan.md、STATUS_REPORT 附錄 W、README |
+
+### 本階段的關鍵事實（實測，非推論）
+
+1. **帳務閉環可核對**：現金＝帳本重建、持倉＝成交重放，`reconcile` 六項
+   核對含竄改偵測（手動改帳戶餘額會被抓到）；重播（同成交再跑一次）
+   不重複扣款與持倉。
+2. **時間正確性有測試**：T+1 開盤成交、盤前不成交、訊號日當日須收盤後
+   下單、漲跌停與停牌不假設成交。
+3. **正式 DB 前後 sha256 完全一致**（`618b02ff…`，全套 489 測試 + 五項
+   唯讀檢查前後）；測試全部走 conftest autouse 暫存 DB。
+4. **無真實下單路徑**：AST 掃描強制 `twstock/paper.py` 不得 import
+   requests/urllib/http/socket/ccxt/shioaji/…；live 模式（含人工確認旗標）
+   下引擎直接拋 `LiveModeForbidden`。
+5. **修正過程中的真實缺陷**（測試與冒煙抓出，非事後補述）：帳本餘額基期
+   重複入金、訂單 INSERT 參數錯位、`replay_positions` 欄位名錯誤、
+   `_drawdown` 微元/元單位混用、`_global_last_trade_date` 未定義、
+   `monkeypatch.undo()` 會解除 DB 隔離（測試改用明確還原）。
+
+## 上一輪 commit（P3 行情來源與資料管線，2026-10-18，已 push 至 `origin/main`）
 
 | 順序 | SHA | 訊息 | 內容 |
 |---|---|---|---|

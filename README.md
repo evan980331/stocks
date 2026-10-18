@@ -128,6 +128,32 @@ python -m twstock.cli quotes poll         :: 以設定的來源實際抓取一�
 > ⚠️ 本機現有 237 則新聞全部寫在狀態治理之前，當時**是否抓取成功無從判定**，
 > 已一律標為 `unknown`（不可追溯）。分數欄位本身可觀察，但不得視為抓取成功。
 
+### 模擬交易（P4 paper；純模擬、不下真單）
+
+```bat
+python -m twstock.cli paper init --cash 1000000  :: 建立虛擬帳戶（冪等）
+python -m twstock.cli paper account             :: 資產／現金／持倉／帳務一致性
+python -m twstock.cli paper cycle               :: 執行一次模擬交易循環（T 日訊號→T+1 成交）
+python -m twstock.cli paper orders|fills|ledger :: 訂單／成交／帳本查詢
+python -m twstock.cli paper risk                :: 風控狀態與停止原因
+python -m twstock.cli paper reconcile           :: 帳務一致性核對（不一致→退出碼 1）
+python -m twstock.cli paper recover             :: 重啟恢復檢查
+python -m twstock.cli paper kill / resume       :: 緊急停止／解除
+```
+
+模擬交易引擎 `twstock/paper.py`：**所有資金與成交皆為模擬**，不接券商、
+不存在真實下單路徑（測試以 AST 掃描強制）。金額以微元整數入帳（無浮點
+帳務誤差）；現金可由帳本重建、持倉可由成交序列重放，`reconcile` 逐項核對；
+成交用 **T+1 開盤價 ± 滑價**（不用 T 日收盤價成交，防 look-ahead）；
+缺價／停牌／漲跌停／行情過期一律「不成交＋記錄原因」；風險限制（單筆/
+部位/現金/單日損失/回撤/行情過期/Kill Switch）全部在成交之前執行。
+儀表板另有唯讀 API `/api/paper/*`（只有 GET，無下單端點）。
+
+> ⚠️ 模擬成交是對真實交易的近似（開盤價±滑價，不模擬排隊與逐檔），
+> **不代表策略具備樣本外優勢**，也**不具備真實自動交易能力**。
+> 盤中即時交易屬 P5，本階段未實作。詳見
+> [`docs/PAPER_TRADING.md`](docs/PAPER_TRADING.md)。
+
 ### 服務生命週期
 
 ```bat
@@ -247,7 +273,9 @@ python -m pytest -q
 ML 標籤、訊號融合尺度、回測時間正確性、風險限制與 Kill Switch，
 擷取狀態治理（六態區分、新聞四態、未來新聞不外洩、舊資料不可追溯、
 Worker 不得把失敗記成完整成功），以及行情介面（去重、舊不得覆蓋新、
-時間戳分離、健康狀態、訊號閘門、Worker 行情輪詢不影響 EOD）。目前 **466 項**。
+時間戳分離、健康狀態、訊號閘門、Worker 行情輪詢不影響 EOD）、
+模擬交易 17 類（帳務閉環、T+1 成交、防重播、風控、重啟恢復、無真實
+下單路徑）。目前 **489 項**。
 
 測試一律將儲存層隔離到暫存 DB（`tests/conftest.py` 的 autouse 夾具），
 **不會**寫入或遷移 `twstock/data_store/` 的真實資料。
@@ -262,3 +290,5 @@ Worker 不得把失敗記成完整成功），以及行情介面（去重、舊�
   survivorship bias 的量化限制與資料來源比較（含授權與價格查證）。
 - [`docs/WORKER_SUBPROCESS.md`](docs/WORKER_SUBPROCESS.md)：Worker 子程序架構評估、
   停止階梯與失敗情境測試（尚未全面遷移）。
+- [`docs/PAPER_TRADING.md`](docs/PAPER_TRADING.md)：P4 模擬交易引擎設計、
+  帳務閉環、成交模擬假設、風險控制與**未實作限制**。

@@ -974,3 +974,107 @@ T+1 開盤進場、無資料視窗不得回報 0%、尾端截斷計數、訊號�
    必須先定義「以哪個表為準」）。
 4. **未修改因子權重／曝險／持有期間；未真實下單；未購買或註冊任何付費服務；
    不宣稱已具備即時交易能力。**
+
+---
+
+# W. P4：模擬交易引擎（2026-10-19）
+
+> 本階段**只做虛擬交易**：資金模擬、成交模擬；不接券商 API、不下真單、
+> **不自動進入 P5**。模擬成交只是對真實交易的近似，不得宣稱與實際券商
+> 成交一致。設計文件見 `docs/PAPER_TRADING.md`。
+
+## W-1. 實作架構與修改檔案
+
+| 檔案 | 內容 |
+|---|---|
+| `twstock/paper.py`（新） | `PaperEngine`：帳戶、訂單狀態機、T+1 成交模擬、微元帳本、WAC 持倉、快照、`reconcile`、風控整合、CLI（12 個子命令） |
+| `twstock/data/store.py` | `paper_*` 七張表（`paper_account/order/fill/position/ledger/snapshot/event`）；金額一律 `*_utwd` 微元整數 |
+| `twstock/risk.py` | 向後相容擴充：`preflight/check_order` 可傳自訂 `limits`（預設 `DEFAULT_LIMITS` 不變） |
+| `twstock/cli.py` | `paper` 子命令（沿用單層 argparse 風格，未破壞既有介面） |
+| `twstock/app.py` | 七個**唯讀** GET API：`/api/paper/{account,positions,orders,fills,ledger,risk,reconcile}`（無任何下單端點） |
+| `tests/test_paper.py`（新） | 23 項測試，對應任務書 17 類 |
+| `docs/PAPER_TRADING.md`（新） | 設計文件、限制與未實作項 |
+| `plan.md` / `README.md` / 本文件 | 狀態更新 |
+
+**沿用而非重造**：成交成本用 `costs.CostModel`；風險用 `risk.py`
+（限制、`KillSwitch`、preflight/check_order）；資料隔離用 conftest autouse
+暫存 DB；訂單去重與帳本防重插用 SQLite 唯一索引；未新增任何與既有
+功能等價的表或服務。
+
+## W-2. 虛擬帳戶／訂單／成交／持倉／帳本／損益是否完整
+
+完整，且互相閉環（`reconcile` 逐項核對）：
+
+- **帳戶**：初始資金、可用現金、`mode='paper'`、狀態；init 冪等（不重複入金）。
+- **訂單**：`pending_new → accepted → partially_filled → filled / cancelled /
+  expired`，拒單為 `rejected` 終態；轉移集中在 `STATUS_TRANSITIONS`，
+  以合法轉移檢查＋樂觀鎖實作，**無直接覆寫路徑**；拒單含原因入庫。
+- **成交**：`fill_id = order_id:fill_date` 唯一；含成交價、滑價前原始價、
+  數量、日期、手續費、稅、費率情境（可追溯）。
+- **持倉**：數量、成本基礎（含買入費用）、WAC 均價、已實現損益；
+  快取與成交重放雙軌核對。
+- **帳本**：有號現金事件（`capital`/`fill`）、餘額鏈、`ref` 唯一防重播；
+  現金事實＝`Σ amount_utwd`。
+- **快照**：總資產、現金、持倉市值、已實現/未實現（分離）、回撤；
+  恆等式 `equity = cash + market_value`。
+- **精確數值**：帳務全路徑微元整數（10⁻⁶ TWD）＋整數股，無浮點累積。
+
+## W-3. 成交模擬與成本假設（如實）
+
+- T 日收盤訊號 → **成交於其後第一個交易日的開盤價 ± 滑價**（與回測
+  `_schedule_entries` 同約定）；**絕不用 T 日已知收盤價成交**；
+  `signal_date` 入庫供稽核；當日 bar 需過 13:30 收盤才認定已發生。
+- 不成交情境（記原因、不假設成功）：缺價、停牌（volume≤0）、
+  漲停開盤買不進、跌停開盤賣不掉、前收不可得、量不足整張、
+  現金不足（成交時才會發生者以縮量/暫緩處理）、逾 `good_til_days` 取消。
+- 費率全部來自 `costs.CostModel`（手續費率×折扣、稅、最低費、滑價、
+  參與率），**未在引擎硬編碼任何費率**；每筆成交記錄費率情境。
+- 整股 1000 股倍數（**零股未實作**）；部分成交量以「當日量 × 參與率、
+  1000 股倍數」為上限，殘量次日續成交。
+- **近似聲明**：漲跌停以前收 ±10% tick 近似；一律用開盤價成交；
+  不模擬盤中分筆撮合、queue、逐檔撮合與真實滑價分布。
+
+## W-4. 風險控制與重啟恢復
+
+- **九道閘全部在進入成交流程之前**：單筆金額、單一股票部位、可用現金
+  （含滑價保守估計）、賣出持倉、單日損失、最大回撤、行情過期、
+  Kill Switch（**下單與成交雙重檢查**）、盤前訊號未就緒；另 live 模式
+  直接拋 `LiveModeForbidden`（連 DB 都不開）。拒單/未成交/過期/取消
+  皆寫 `paper_event` 稽核。
+- **重啟恢復**：引擎無記憶體狀態，`recover()` 由 DB 重建（帳本現金、
+  成交重放持倉、未完成訂單）；測試驗證新實例重啟後帳務一致、
+  未成交訂單可續成交。
+- **失敗安全**：單一 DB 交易失敗整筆回滾（測試注入失敗驗證無半套資料）；
+  完整性錯誤 → `IntegrityBroken` → 停止交易（不吞錯、不繼續）。
+
+## W-5. 測試與退出碼（2026-10-19 實測）
+
+| 指令 | 結果 |
+|---|---|
+| `python -m pytest tests/test_paper.py -q` | **23 passed** |
+| `python -m pytest -q`（全套） | **489 passed，退出碼 0**（上階段 466，+23） |
+| `python -m compileall -q twstock tests` | 退出碼 0 |
+| `TWSTOCK_READONLY=1 twstock.cli datacheck` | 退出碼 0 |
+| `TWSTOCK_READONLY=1 twstock.cli validate` | 退出碼 0（報告寫入 reports/） |
+| `TWSTOCK_READONLY=1 twstock.cli research` | 退出碼 0 |
+| `TWSTOCK_READONLY=1 twstock.cli status` / `health` | 退出碼 0 |
+| 正式 DB sha256（全套測試＋五項檢查前後） | `618b02ff…87665` **前後一致** |
+| `twstock.cli paper reconcile`（隔離 DB 實測） | 退出碼 0（帳務一致） |
+
+17 類對應：初始帳戶①、買賣帳務②、費率稅③、持倉成本損益④、拒單⑤、
+重複防護⑥、取消與轉移⑦、部分成交⑧、過期/缺價/停牌/時點⑨、漲跌停⑩、
+曝險與損失限制⑪、緊急停止⑫、重啟恢復⑬、交易失敗回滾⑭、帳本重建核對⑮、
+正式 DB 隔離⑯、無真實下單路徑⑰（AST 掃描 + live 拒絕）。
+
+## W-6. 本階段仍然未解決的問題與真實交易限制
+
+1. **不具備真實自動交易能力**：無券商連線、無真實下單路徑（有測試強制）；
+   模擬成交 ≠ 券商實際成交（開盤價 ± 滑價近似，不模擬排隊與逐檔）。
+2. **P5 未開始**（依停止條件不在本階段自動進入）：盤中即時交易、
+   分筆撮合、盤中停損、quote 表進場閘門與 `intraday_signal_gate` 完整串接
+   （本階段成交依據為 price 日K表）。
+3. **零股交易未實作**；漲跌停為 ±10% 近似（未接證交所逐檔規則）。
+4. **策略樣本外優勢仍未確立**（P2.9 結論）：模擬交易是帳務/風控基礎建設，
+   **不代表策略具備可交易優勢**，不得據此宣稱可上線。
+5. **行情新鮮度以 price 日K最大日期計算**（EOD 語意）；quote 表的即時
+   新鮮度尚未接入 paper 下單路徑。
