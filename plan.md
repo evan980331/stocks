@@ -688,13 +688,12 @@ python -m pytest -q
 
 ---
 
-## 本輪 commit（P3 行情來源與資料管線，2026-10-18）
+## 本輪 commit（P3 行情來源與資料管線，2026-10-18，已 push 至 `origin/main`）
 
-| 項目 | 內容 |
-|---|---|
-| 新增 | `twstock/data/quotes.py`（統一行情介面：來源目錄、8 個來源條目、MIS/FinMind 分鐘解析器、驗證、健康狀態、訊號閘門、CLI main）、`twstock/quotes.py`、`tests/test_quotes.py`（74 項）、`docs/QUOTE_SOURCE_ASSESSMENT.md` |
-| 修改 | `store.py`（`quote` 表 + 主鍵 + 索引）、`worker.py`（行情輪詢：非致命、未設定不動作、心跳與稽核軌跡）、`cli.py`（`quotes` 子命令）、`data/__init__.py` |
-| 文件 | `docs/STATUS_REPORT.md` V-1~V-6、`docs/DATA_SOURCES.md` §5、`README.md`、`.env.example` |
+| 順序 | SHA | 訊息 | 內容 |
+|---|---|---|---|
+| 1 | `7ec387b` | `feat(quotes): 統一台股行情介面、資料品質與可靠性管線（P3）` | twstock/data/quotes.py、twstock/quotes.py、cli.py、store.py（quote 表）、worker.py、tests/test_quotes.py（74 項，全套 466 passed）、.env.example |
+| 2 | （本文件所在 commit） | `docs: 記錄 P3 行情來源評估、統一介面與資料管線結果` | 本文件、STATUS_REPORT 附錄 V、DATA_SOURCES §5、QUOTE_SOURCE_ASSESSMENT.md、README |
 
 ### 本階段的關鍵事實（實測，非推論）
 
