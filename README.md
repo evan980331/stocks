@@ -95,6 +95,25 @@ python -m twstock.cli stress         :: 四種壓力期間定義 + 等曝險／�
 python -m twstock.cli health         :: 含最近一輪各資料集的擷取狀態
 ```
 
+### 行情來源與健康狀態（P3）
+
+```bat
+python -m twstock.cli quotes              :: 來源評估與健康狀態（不連網）
+python -m twstock.cli quotes catalog      :: 8 個來源的分類、認證、限流、授權與查證狀態
+python -m twstock.cli quotes selftest     :: 假來源自檢（寫入沙盒暫存 DB，不碰正式資料庫）
+python -m twstock.cli quotes poll         :: 以設定的來源實際抓取一次（需 TWSTOCK_QUOTE_SOURCE）
+```
+
+行情來源介面 `twstock/data/quotes.py`：每筆行情保留**來源市場時間**（含原樣字串）
+與**系統取得時間**，兩者不得互相冒充；重複去重、**舊不得覆蓋新**；
+來源失敗不得降級成「正常無資料」；健康狀態分正常／延遲／失敗／未知／非交易時段；
+過期或異常一律禁止通過盤中訊號閘門（未來盤中路徑用；目前訊號仍為盤後產生）。
+
+> ⚠️ **本專案目前沒有即時行情**：唯一預設啟用的行情來源是 FinMind 分鐘資料
+>（**延遲**、延遲未載明故不稱即時）；TWSE MIS 端點受條款限制需 opt-in，
+> 預設停用；Fugle／券商 API 需註冊或帳戶，未實作。完整評估見
+> [`docs/QUOTE_SOURCE_ASSESSMENT.md`](docs/QUOTE_SOURCE_ASSESSMENT.md)。
+
 每次擷取都會留下**結構化狀態**（`ingest_run` 資料表），明確區分六種結果：
 `success_with_data`（成功且有資料）、`success_empty`（來源正常但確實沒資料）、
 `partial_success`、`failed`、`skipped`、`unknown`（舊資料不可追溯）。
@@ -145,6 +164,8 @@ twstock/
     report.py          # 資料品質報告：新聞覆蓋率、抓取成功率／失敗率、狀態分佈
     quality.py         # 無效價格清理、除權息／分割還原與驗證守門
     loader.py          # 價格載入（清理 + 還原，策略與基準一致）
+  data/
+    quotes.py         # 統一行情介面：來源目錄、驗證、健康狀態、訊號閘門（P3）
   sentiment/           # Google News RSS + 規則式情緒；專家觀點來源（共用狀態化取得）
   features.py          # 技術指標（RSI/KD/MACD/布林/K線型態）+ 籌碼 + 營收 + 情緒
   signals.py           # 規則式多因子打分 + 尺度無關的訊號融合
@@ -185,6 +206,9 @@ docs/STATUS_REPORT.md  # 專案現況盤點報告
 | YouTube RSS / Google News | 專家觀點 | 手動 | 公開 RSS |
 
 **行情為延遲/收盤後資料，並非即時行情**。儀表板一律顯示「最新行情日期」與延遲天數。
+**沒有已查證、可無條件使用的免費官方台股盤中即時來源**（評估與條款查證見
+[`docs/QUOTE_SOURCE_ASSESSMENT.md`](docs/QUOTE_SOURCE_ASSESSMENT.md)）；
+本專案的行情介面已就緒，但真實盤中來源尚未接通。
 
 缺值／失敗處理原則：抓取失敗一律記為失敗（不回填 0），資料不足時標記「無法判斷」，
 不產生看似正常的訊號。
@@ -221,8 +245,9 @@ python -m pytest -q
 
 涵蓋：特徵計算、規則打分、情緒、寫入冪等（不覆蓋其他標的）、ingest 失敗處理、
 ML 標籤、訊號融合尺度、回測時間正確性、風險限制與 Kill Switch，
-以及擷取狀態治理（六態區分、新聞四態、未來新聞不外洩、舊資料不可追溯、
-Worker 不得把失敗記成完整成功）。目前 **303 項**。
+擷取狀態治理（六態區分、新聞四態、未來新聞不外洩、舊資料不可追溯、
+Worker 不得把失敗記成完整成功），以及行情介面（去重、舊不得覆蓋新、
+時間戳分離、健康狀態、訊號閘門、Worker 行情輪詢不影響 EOD）。目前 **466 項**。
 
 測試一律將儲存層隔離到暫存 DB（`tests/conftest.py` 的 autouse 夾具），
 **不會**寫入或遷移 `twstock/data_store/` 的真實資料。

@@ -882,3 +882,95 @@ T+1 開盤進場、無資料視窗不得回報 0%、尾端截斷計數、訊號�
 5. **月營收仍以公告日近似**（B5，既有），非嚴格 point-in-time。
 6. **未修改因子權重／曝險／持有期間／交易規則；未真實下單；未購買資料服務；
    未部署至 Vercel／Cloudflare；不宣稱策略具備可交易優勢。**
+
+---
+
+## V. P3：台股即時行情與資料管線建置（2026-10-18）
+
+> 完整來源評估見 [`docs/QUOTE_SOURCE_ASSESSMENT.md`](QUOTE_SOURCE_ASSESSMENT.md)
+> （與 `python -m twstock.cli quotes catalog` 程式同源）。本節只記結論與證據。
+
+### V-1. 實際接通的行情來源（如實區分）
+
+| 來源 | 種類 | 狀態 |
+|---|---|---|
+| FinMind 分鐘資料（`finmind_minute`） | **延遲** | 介面完成、**唯一預設啟用**；本階段**未實際呼叫外部 API**（單元測試一律注入假 getter） |
+| TWSE MIS（`mis`） | 即時（端點觀察） | 介面完成、**預設停用**；TWSE 條款禁止未經同意的自動化擷取 → 需 `TWSTOCK_QUOTE_ALLOW_MIS=1` opt-in；本階段**未對真實端點發出任何請求** |
+| 假來源（`fake`） | 合成 | 僅供測試與自檢；`is_fabricated=True`，selftest 強制沙盒暫存 DB |
+| Fugle／Shioaji／富邦 NEO／Yahoo／TWSE OpenAPI | — | **只有來源目錄條目與分類，無 fetch 實作**（不影響現有流程） |
+
+**結論：沒有已查證、可無條件使用的免費官方台股盤中即時來源。**
+本階段**未取得任何真實盤中行情**；「是否真的取得盤中行情」的答案是**否**。
+驗證方式：全部測試以注入假資料驅動；CLI selftest 明確印出「合成（假）行情」與
+「時間基準為合成時間戳」；未設定來源時 `quotes poll` 明確回報 exit 2，不臆測來源。
+
+### V-2. 統一行情介面（`twstock/data/quotes.py`）
+
+- 每筆行情表達：代碼、價格／量、`market_time`（來源市場時間，另存原樣字串
+  `market_time_raw`）、`fetched_at`（系統取得時間）、來源、種類
+  （realtime/delayed/eod/historical）、驗證狀態與錯誤分類。
+  **取得時間不得偽裝成市場時間，舊行情不得冒充新行情**
+  （`market_time_source=unknown` 一律不得當成新行情）。
+- 寫入 `quote` 表（新 schema，主鍵 `(source, kind, stock_id, market_time)` ＝
+  冪等去重鍵；`store.write_df(..., if_conflict="ignore")`）。
+- 驗證規則（皆有測試）：缺值／非正價格／超出漲跌停／代碼不符或不在股票池／
+  日期非當日／非交易時段／時間來源不可得／市場時間晚於取得時間（時鐘矛盾）。
+- **舊不得覆蓋新**：跨批次（與 DB 既有最大市場時間比）與**批次內**都擋。
+- 健康狀態五態互斥：`normal`／`delayed`（年齡門檻 300 秒）／`failed`（硬性抓取失敗
+  優先）／`unknown`（未設定、無資料、合成資料）／`non_trading_session`。
+- `intraday_signal_gate`：資料過期、來源失敗、合成資料、非交易時段一律
+  **禁止產生看似有效的即時訊號**（本階段訊號仍是盤後產生，閘門不影響既有流程）。
+
+### V-3. Worker 整合（最小必要）
+
+- Worker 新增獨立的行情輪詢步驟：`TWSTOCK_QUOTE_SOURCE` 未設定則完全不動作；
+  收盤／週末不輪詢；心跳記錄 `quote_polled_at/health/session/fabricated/reason`；
+  輪詢結果同時寫 `ingest_run`（dataset=quote，可稽核）。
+- **行情輪詢失敗不影響 EOD 流程成敗**（有測試：輪詢拋 ConnectionError 時
+  `run_forever` 仍回 0、`last_cycle_ok=True`、心跳 `quote_health=failed`）。
+- 保留既有單實例鎖、逾時、重試退避與停止機制（重複啟動拒絕時**不得**進行任何輪詢）。
+- **未改變**任何策略權重、曝險、持有期間；未接入券商 API；不下單。
+
+### V-4. 本階段發現並修正的缺陷（自我複核）
+
+1. **selftest 污染正式資料庫（最嚴重）**：`quotes selftest` 原本寫入當時設定的 DB；
+   以 CLI 實跑時對正式 `twstock_v3.db` 寫入 20 列假行情（md5 由 `3523521e…`
+   變為 `336aedfb…`）。**已修正**：selftest 強制寫入沙盒暫存 DB
+   （`TemporaryDirectory`），並以 hash 驗證正式 DB 不再被觸碰；
+   污染的 20 列已刪除（`DELETE WHERE source='fake' AND run_id='selftest'`，
+   `PRAGMA integrity_check=ok`）。修正後 hash 為 `c0a11143…`
+   （**與污染前不同是預期的**：SQLite 刪列不還原頁面配置；資料內容已還原，
+   price 10,249／news 237／signals 9,720／ingest 紀錄皆未受影響）。
+2. `validate_batch` 原本只擋「完全相同」的重複，**批次內較舊行情仍可通過**
+   → 已改為批次內同樣「舊不得覆蓋新」。
+3. `write_quotes` 收到呼叫端 `run_id` 但未寫入列 → 稽核軌跡斷鏈，已修正。
+4. 健康狀態判定順序：非交易時段原本會被「尚無任何行情紀錄」（unknown）蓋掉
+   → 已改為非交易時段優先（收盤時沒有新資料是預期，不是未知）。
+
+### V-5. 測試與退出碼
+
+| 命令 | 結果 | 退出碼 |
+|---|---|---:|
+| `python -m pytest -q` | **466 passed**（392 → +74，`tests/test_quotes.py`） | **0** |
+| `python -m compileall -q -f twstock tests` | 全部編譯成功、無警告 | **0** |
+| `python -m twstock.cli quotes catalog/status/selftest` | 來源評估、健康狀態、沙盒自檢（20 檔寫入、閘門「禁止」） | **0** |
+| `TWSTOCK_READONLY=1 python -m twstock.cli quotes status` | 唯讀模式正常（不建表、不寫入） | **0** |
+| 真實 DB `md5`（完整 pytest 前後） | `c0a11143b351ea0c653969ebc29ede7b` **不變** | — |
+
+`tests/test_quotes.py`（74 項）對應任務要求的 10 類：正常解析與寫入、重複去重、
+舊不得覆蓋新、來源時間與取得時間分離、延遲行情分類、斷線／限流／格式錯誤與重試、
+交易時段判斷、過期資料不得通過訊號閘門、Worker 重啟與單實例保護、
+正式資料庫安全與既有功能回歸。
+
+### V-6. 本階段仍然未解決的問題
+
+1. **沒有真實盤中行情來源在跑**：介面與管線就緒，但唯一預設啟用的來源是
+   「延遲」的 FinMind 分鐘資料，且本階段未實際呼叫；要真正接通即時行情，
+   使用者需在「註冊 Fugle API key」或「辦理券商帳戶（Shioaji/富邦）」
+   或「與 TWSE 訂約」之間做決定（皆超出本階段授權）。
+2. **Worker 行情輪詢未在真實環境長跑驗證**（需先設定來源並在交易時段啟動）。
+3. 訊號閘門只在盤中路徑有意義；**EOD 訊號路徑尚未套用任何行情新鮮度檢查**
+   （因為 EOD 訊號依賴的是日K歷史表，不是 quote 表——若 P4 模擬交易要混合使用，
+   必須先定義「以哪個表為準」）。
+4. **未修改因子權重／曝險／持有期間；未真實下單；未購買或註冊任何付費服務；
+   不宣稱已具備即時交易能力。**
