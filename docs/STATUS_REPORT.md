@@ -1076,5 +1076,138 @@ T+1 開盤進場、無資料視窗不得回報 0%、尾端截斷計數、訊號�
 3. **零股交易未實作**；漲跌停為 ±10% 近似（未接證交所逐檔規則）。
 4. **策略樣本外優勢仍未確立**（P2.9 結論）：模擬交易是帳務/風控基礎建設，
    **不代表策略具備可交易優勢**，不得據此宣稱可上線。
-5. **行情新鮮度以 price 日K最大日期計算**（EOD 語意）；quote 表的即時
-   新鮮度尚未接入 paper 下單路徑。
+5. ~~行情新鮮度以 price 日K最大日期計算（EOD 語意）；quote 表的即時
+   新鮮度尚未接入 paper 下單路徑~~ → **P5 已接入**（`gate.py` fail-closed；
+   盤中新單另要求可驗證即時行情，見附錄 X）。
+
+---
+
+# 附錄 X：P5 本地自動化執行、行情閘門與故障恢復（2026-10-21）
+
+## X-1. 實作架構與修改檔案
+
+| 檔案 | 用途 |
+|---|---|
+| `twstock/orchestrator.py`（新） | 七階段輪次協調（ingest→quotes→quality→signals→paper→reconcile→health）、`run_round`/`run_stage` 紀錄、冪等續跑、單實例鎖、有限重試＋退避、輪次逾時、事件（`run_alert`）、`audit_report`（唯讀稽核）、`health_report`、CLI `p5` 六子命令 |
+| `twstock/gate.py`（新） | 行情品質閘門：`evaluate()` 兩層判定（新單/既有單成交）、日線基礎、盤中即時基礎、時段規則、時鐘不一致、fail-closed |
+| `twstock/data/store.py` | 新增 `run_round`（PK=run_id）、`run_stage`（PK=(run_id,stage)）、`run_alert` 三表 |
+| `twstock/paper.py` | `place_order` 最後一道閘門；`run_paper_cycle` 閘門先行（blocked 時零新單但保留決策供稽核）；`process_pending` 帳務不一致暫停成交；`reason`/快照 note 帶 `run_id`（**不進 client_order_id，維持跨輪冪等**） |
+| `twstock/worker.py` | `_run_p5_task` 與 `--p5` 旗標：Worker 可改跑 P5 輪次（partial_success 不計失敗、failed 計失敗） |
+| `twstock/cli.py` | `p5 run|status|errors|audit|gate|alerts`（`run --due` 排程冪等） |
+| `twstock/app.py` | 五個唯讀 GET API：`/api/p5/health|audit|gate|runs|alerts`（無下單端點，測試掃描） |
+| `tests/test_p5_orchestrator.py`（新，24 項） | 14 類驗收情境（見 X-4） |
+| `docs/LOCAL_AUTOMATION.md`、`docs/RISK_GATES.md`（新）、`.env.example` | 操作手冊、閘門/故障排除、P5 安全預設 |
+
+## X-2. 自動化流程實際串接（非空殼）
+
+七階段全部呼叫既有元件：`pipeline.ingest()`（IngestSummary 結構化狀態）、
+`worker.run_quote_cycle()`（未設定來源→`skipped(policy)`，失敗→`failed`）、
+本輪資料品質檢查（`gate.daily_basis`＋`quality.find_invalid_price_rows`＋
+未來日期/訊號價量一致性）、`pipeline.run_scores()`、`paper.PaperEngine.run_paper_cycle()`
+（受閘門約束）、`paper.reconcile()`、`health_report()`。
+每輪唯一 `run_id` 串起：`run_stage`（含 ingest run_id）→ `paper_order.reason`
+→ `paper_fill` → `paper_ledger` → `paper_snapshot.note`（測試驗證追查鏈）。
+輪次狀態由階段狀態推導：任一 `failed` → 最高 `partial_success`；
+paper 階段上游任一 `failed` → `skipped(blocked)` 零新單；
+依規則略過（policy，如未設定行情來源）不污染輪次結果。
+
+## X-3. 行情品質閘門實際阻擋條件（fail-closed）
+
+兩層判定：`allow_new_orders`（新單）與 `allow_fills`（既有單成交）分開。
+
+- **擋新單**：Kill Switch；price 零列/延遲 > 3 天/最新列價格異常；
+  未建立帳戶或 `reconcile` 不一致；週末（policy）；盤中未設定可驗證即時
+  來源、來源非 realtime 種類、quote 零列、`market_time` 未知/不可解析、
+  行情時間晚於系統時間 > 120 秒、年齡 > 300 秒、缺 `fetched_at`、
+  `intraday_signal_gate` 未通過；訊號日為今日且未收盤（P4 規則）。
+- **擋成交**：僅 Kill Switch 與帳務不一致（行情問題仍可依已存行情成交，
+  沿用 P4 語意）；**停止交易不等於清倉**（不賣出、不自動取消持倉）。
+- **抓到 ≠ 夠新**：`fetched_at`（抓取時間）與 `market_time`（行情時間）
+  在判定與 `details.quote` 分開記錄；只有日線/延遲資料時盤中一律拒絕
+  （`basis=intraday` 要求 realtime）。
+- 拒單理由入 `paper_order.reject_reason`＋`paper_event`；成交暫停入 `no_fill`
+  事件（`trading_halted`）；輪次阻擋入 `run_stage.error`＋`run_alert`。
+
+## X-4. 故障恢復、冪等性、kill switch 與帳務核對（實測）
+
+- **崩潰續跑（真實子程序）**：子程序寫入一階段後 `os._exit(9)` 硬崩潰 →
+  `ended_at IS NULL` 輪次自動續跑：已完成階段不重執行（呼叫計數驗證）、
+  執行中階段重做、輪次正常收尾；殘留 `p5run.lock`（PID 已死）自動回收。
+- **雙協調器**：存活 PID 持有鎖 → 後到者 `busy=True`、零階段寫入（真實
+  子程序持鎖驗證，避免同行程 PID 相同）。
+- **冪等**：同日重跑零新增訂單/成交/帳本；指定 `run_id` 續跑不重執行；
+  訂單層另有 `client_order_id`/`fill_id`/帳本 `ref` 三層唯一鍵。
+- **逾時與重試**：單輪預算（`TWSTOCK_P5_TIMEOUT_S`）用盡 → 後續階段
+  `skipped(逾時)`；階段重試 3 次、退避 [1s, 2s]、`attempts` 入庫。
+- **交易失敗回滾**：成交中注入失敗 → 無 fill、無帳本事件、訂單維持
+  accepted、`reconcile.ok=True`。
+- **Kill Switch**：paper 階段 `skipped(blocked)`＋事件記錄原因；再跑仍被阻；
+  **只可手動** `paper resume` 解除（無自動解除路徑）。
+- **帳務不一致**：`audit_report` 發現（只回報）；閘門同時擋新單與成交；
+  以封死 `store.write_df/exec_sql` 驗證稽核本身**零寫入**；現金與帳務表前後
+  完全不變（無靜默修帳）。
+- **健康狀態**：程序存活但行情延遲 > 門檻 → `data_stale`（`process.alive=True`
+  且 `data.fresh=False`），不只看程序存活。
+
+## X-5. 測試與退出碼（2026-10-21 實測）
+
+| 指令 | 結果 |
+|---|---|
+| `python -m pytest -q`（全套） | **515 passed，退出碼 0**（上階段 489，+26） |
+| `python -m compileall -q twstock tests` | 退出碼 0 |
+| `TWSTOCK_READONLY=1` 下 `datacheck`/`validate`/`research`/`status`/`health` | 皆退出碼 0 |
+| `TWSTOCK_READONLY=1` 下 `p5 status`/`errors`/`alerts`（正式庫，尚無 P5 表） | 皆退出碼 0，明確提示「P5 資料表尚未建立（唯讀模式不會建立）」 |
+| `TWSTOCK_READONLY=1` 下 `p5 gate`（正式庫） | 退出碼 1：**行情過期 8 天 → 禁止新增模擬交易**（fail-closed 在真實資料上生效） |
+| `TWSTOCK_READONLY=1` 下 `p5 audit`（正式庫） | 退出碼 1：未建立 paper 帳戶（如實回報，不 500） |
+| 正式 DB sha256（全套測試＋五項唯讀檢查＋p5 唯讀命令前後） | `618b02ff…87665` **前後一致**（見 X-7） |
+
+26 項對應 14 類：正常一輪①、無行情停交易②、過期/時間未知③、部分失敗標記④、
+重複執行零新增⑤（＋排程層冪等）、雙協調器拒絕⑥、子程序崩潰續跑⑦、
+交易失敗回滾⑧、kill switch⑨、帳務不一致不修帳⑩、逾時與重試上限⑪、
+時段邊界⑫、活著但過期的健康狀態⑬、正式 DB 隔離⑭（＋舊庫唯讀相容、
+唯讀跳過、閘門回報、API、CLI、worker 整合、事件送達）。
+
+## X-6. 本階段仍然未解決的問題與真實交易限制
+
+1. **不具備真實自動交易能力**（同 P4）：無券商連線、無真實下單路徑；
+   紙上交易成功 ≠ 策略具備獲利能力（P2.9：樣本外優勢未確立）。
+2. **真實行情來源未實際連線驗證**：P5 全部行情閘門測試以**隔離暫存 DB 的
+   模擬行情**驗證；FinMind 分鐘資料為**延遲**（延遲未載明）、MIS 受條款
+   限制需 opt-in，本階段**未對任何真實行情端點發出請求** → 盤中路徑在
+   現實環境仍會因「無可驗證即時來源」fail-closed（這是設計，不是缺陷）。
+3. **無國定假日曆**（沿用 P3 已知限制）：假日白天可能被當成交易日；
+   由「盤中無新鮮行情」與「日線過期」兩道 fail-closed 補防，但非硬性假日表。
+4. **排程不保證**：電腦休眠/關機/網路中斷/配額限制下的影響已記錄於
+   `docs/LOCAL_AUTOMATION.md`；當日輪冪等不補跑（錯過即等次一交易日）。
+5. **事件外送非可靠通道**：Telegram 需顯式啟用且無 SLA；未啟用時
+   `delivered=not_configured`，事件僅存 `run_alert` 表與 CLI（不假裝已送達）。
+6. **P6（券商 API）未開始**：依停止條件停在 paper trading 階段。
+
+## X-7. 正式資料庫完整性與本機 Worker 實測（2026-10-21）
+
+- **sha256**：全套 515 項測試＋五項唯讀檢查＋`p5` 唯讀命令前後均為
+  `618b02ffba30cfc1c1b8618c8e3a2cc7afbe309a461f0ee80bce715ff3987665`
+  （**前後一致**，未發現任何測試或程式寫入正式庫）。
+- **正式庫副本上的補表遷移**（非正式庫本體）：以正式庫副本執行可寫 `p5 status`
+  → 自動建立 `run_round`/`run_stage`/`run_alert` 三表；既有 7 張 `paper_*` 表、
+  10,249 列價量與 237 列新聞**完整保留**（`CREATE TABLE IF NOT EXISTS`，不碰資料）。
+- **本機 Worker 有限實測**（沙盒暫存 DB＋狀態目錄；當時 01:35 非交易時段，
+  EOD 任務依設計跳過、**未對任何外部來源發出請求**）：
+  1. `start worker` → 心跳 `status=running`、`last_result=run_cycle 成功（嘗試1次,0.7s）`、
+     鎖持於 PID 28692；
+  2. 再次 `start worker` → 「已在執行（PID 28692）」（重複啟動被拒）；
+  3. `stop worker` → 「已安全停止」，PID 檔/停止旗標/鎖全部清理；
+  4. 佈置崩潰現場（殘留鎖=死 PID 4194303、心跳 `task_running`）→
+     重新啟動（PID 19548）自動回收殘留鎖、`interrupted_last_run=True`、
+     任務正常執行 → 再次安全停止。
+  **限制**：僅數分鐘、非交易時段、未驗證盤中長跑與真實行情連線（見 X-6.2）。
+
+## X-8. 交付前自我複核發現並修正的問題
+
+1. **正式庫以唯讀開啟時 `p5 status`/`errors` 直接崩潰**（`no such table:
+   run_round`）：可寫模式會自動補表，但唯讀模式不會遷移 → 按 P3 `quote` 表
+   舊庫相容先例修正：監控查詢缺表時回空結果＋明確提示「P5 資料表尚未建立
+   （唯讀模式不會建立）」，退出碼 0 不崩潰；並新增舊庫唯讀相容測試（26 項）。
+2. **時序測試在滿載時偶發不穩**：輪次逾時測試的預算（0.01s）短於單階段
+   完成時間 → 改為 0.3s 預算＋0.5s 單階段，保持驗證意圖（超時後續階段
+   `skipped`）而不依賴機器速度。

@@ -2,7 +2,7 @@
 
 > 本文件是**反映實際進度的工作文件**，不是願景文件。
 > 每次完成一個可獨立驗證的工作單位就更新本檔，並以可重現證據區分 `DONE` 與 `VERIFIED`。
-> 最後更新：2026-10-18（P3 行情來源與資料管線）
+> 最後更新：2026-10-21（P5 本地自動化執行、行情閘門與故障恢復）
 
 ---
 
@@ -467,6 +467,52 @@ Kill Switch 只「禁止新增正式委託」，**不刪除交易紀錄、不自
   就會對使用者資料觸發遷移（實測時間戳 `2026-10-15T00:11:04`）。
   已改為 autouse 隔離，並實測確認跑完 `pytest` 後真實 DB 雜湊**不變**。
 
+### W27 — P5 本地自動化執行、行情閘門與故障恢復 ✅ `DONE`（純模擬，停在 paper，不進 P6）
+- **成果**：`twstock/orchestrator.py`（新，七階段協調器：ingest→quotes→
+  quality→signals→paper→reconcile→health）、`twstock/gate.py`（新，行情品質
+  閘門）、`store.py` `run_round`/`run_stage`/`run_alert` 三表、`paper.py` 閘門
+  接線（`place_order` 最後一道＋`run_paper_cycle` 閘門先行＋成交暫停）、
+  `worker.py --p5`、`cli p5` 六子命令、`app.py` 五個唯讀 API、
+  `tests/test_p5_orchestrator.py`（26 項，涵蓋 14 類驗收情境）、
+  `docs/LOCAL_AUTOMATION.md`、`docs/RISK_GATES.md`、`.env.example` P5 區塊。
+- **輪次與冪等**：每輪唯一 `run_id`（`p5-…`）寫 `run_round`，每階段記錄
+  起訖/耗時/狀態/筆數/錯誤/重試次數（`run_stage`，PK=(run_id,stage)）；
+  狀態沿用既有六態，輪次層 `success/partial_success/failed/skipped`；
+  崩潰後 `ended_at IS NULL` 自動續跑、**已完成階段不重複執行**；訂單層再由
+  `client_order_id`/`fill_id`/帳本 `ref` 三層唯一鍵防重播（重跑同日零新增）。
+  追查鏈：`run_id` → `run_stage`（含 ingest run_id）→ `paper_order.reason`
+  → `paper_fill` → `paper_ledger`。
+- **單一來源失敗不誤報整輪成功**：任一階段 `failed` → 輪次最高
+  `partial_success`；paper 階段的上游（ingest/quotes/quality/signals）任一
+  `failed` → 直接 `skipped(blocked)`，零新單（fail-closed）。
+- **P5-B 閘門（實際接進成交路徑）**：`gate.evaluate()` 兩層判定——
+  `allow_new_orders`（新單）與 `allow_fills`（既有單成交）分開；擋新單：
+  無行情/過期>3 天/最新列異常價格/時間戳未知/時鐘不一致/盤中無可驗證即時
+  行情（未設定來源、非 realtime 種類、零列、缺 fetched_at、`intraday_signal_gate`
+  未通過）/週末/帳務不一致/Kill Switch；擋成交僅 Kill Switch 與帳務不一致
+  （行情問題仍可依已存行情成交＝P4 語意）；**停止交易不等於清倉**。
+  `fetched_at`（抓到）與 `market_time`（夠新）在判定與回報中分開記錄。
+- **P5-C 保護**：`p5run.lock` 單一實例（PID 死亡回收、雙啟動拒絕）、
+  階段級有限重試＋指數退避、單輪逾時預算（超時階段 `skipped(逾時)`）、
+  paper 交易仍為 BEGIN IMMEDIATE 單一交易（失敗整筆回滾）、
+  Kill Switch 只可手動解除；健康狀態不只看程序存活（資料新鮮度、錯誤率、
+  帳務一致、心跳，可辨識「活著但資料過期」）。
+- **P5-D 核對與監控**：`orchestrator.audit_report()`（唯讀：帳本/持倉/成交/
+  訂單/快照恆等式、未完成與重複訂單、現金與估值一致性、worker 心跳與最後
+  成功時間、閘門狀態）；不一致只回報＋阻擋，**不修帳**（以封死寫入函式驗證）；
+  `/api/p5/*` 五個 GET 端點無任何下單端點；事件寫 `run_alert`，Telegram
+  外送需顯式 `TWSTOCK_ALERT_TELEGRAM=1`，`delivered` 如實記錄送達狀態。
+- **驗證**：`pytest -q` → **515 passed**（上階段 489，+26）；`compileall` 0；
+  五項唯讀檢查＋`p5 status/errors/alerts` 唯讀皆退出碼 0；`p5 gate` 在
+  正式庫唯讀下退出碼 1（**真實資料延遲 8 天 → fail-closed 禁新單**）；
+  **正式 DB sha256（全套測試＋唯讀檢查前後）`618b02ff…87665` 一致**；
+  正式庫**副本**上驗證可寫補表遷移（三表新增、舊資料完整保留）；
+  本機 worker 沙盒實測：啟動/重複啟動拒絕/安全停止/崩潰殘留鎖回收＋
+  `interrupted_last_run` 恢復（見 STATUS_REPORT 附錄 X-7）。
+- **自我複核修正**（詳見 STATUS_REPORT X-8）：(1) 正式庫唯讀開啟時
+  `p5 status` 因缺 P5 三表崩潰 → 改為回空結果＋明確提示（舊庫相容）；
+  (2) 輪次逾時測試在滿載時偶發不穩 → 加餘裕保持驗證意圖。
+
 ### W26 — P4 模擬交易引擎 ✅ `DONE`（純模擬，不接券商、不進 P5）
 - **成果**：`twstock/paper.py`（新，約 1.5k 行：帳戶/訂單狀態機/T+1 成交
   模擬/微元帳本/WAC 持倉/快照/reconcile/風控/CLI）、`store.py` `paper_*`
@@ -589,10 +635,18 @@ python -m pytest -q
   拒單、重複防護、取消與狀態轉移、部分成交、行情過期/缺價/停牌/時點、
   漲跌停、風控上限、緊急停止、重啟恢復、交易失敗回滾、帳本重建核對、
   正式 DB 隔離、**無真實下單路徑（AST 掃描）**、CLI/API（W26，23 項） |
+| `tests/test_p5_orchestrator.py` | P5 自動化 14 類：正常一輪（階段起訖/筆數/追查鏈）、無行情停交易、
+  過期/時間戳未知/盤中無即時來源 fail-closed、來源部分失敗標記
+  `partial_success`、上游失敗阻擋 paper、同日重跑零新增訂單、續跑不重複
+  執行已完成階段、雙協調器拒絕、**真實子程序崩潰後續跑**、交易失敗回滾、
+  kill switch 不自動解除、帳務不一致只回報不修帳（封死寫入驗證）、
+  輪次逾時與重試上限/退避、週末與盤前/盤中/盤後邊界、「活著但資料過期」
+  健康狀態、正式 DB 隔離、唯讀模式、閘門回報、唯讀 API、CLI、worker 整合、
+  事件送達狀態（W27，26 項） |
 
 **現況**：P0 基準 `14 passed` → 首輪修復後 **`55 passed`** → P2.7 後 **`303 passed`**
 → P2.8 後 **`362 passed`** → P2.9 後 **`392 passed`** → P3 行情管線後 **`466 passed`**
-→ P4 模擬交易後 **`489 passed`**。
+→ P4 模擬交易後 **`489 passed`** → P5 自動化後 **`515 passed`**。
 
 實際執行項目與結果：
 
@@ -657,7 +711,7 @@ python -m pytest -q
 | branch | `main` |
 | remote | `origin` → `https://github.com/evan980331/stocks` |
 | P0 起始 HEAD | `794a0ff chore: init TW stock predictor project` |
-| 本輪 commit | 見文末「本輪 commit（P2.8）」 |
+| 本輪 commit | 見文末「本輪 commit（P5）」 |
 | push | 依使用者授權執行（見 §12 回報） |
 
 ---
@@ -703,8 +757,14 @@ python -m pytest -q
 5. **B20 CI**：把 `pytest` 與重跑報告納入自動化。
 6. **P4 模擬交易 ✅ 已完成（2026-10-19）**：委託狀態機、T+1 成交模擬、
    微元帳本與 reconcile、風控九道閘、`cli paper` 與唯讀 API、23 項測試
-   （見 W26 與 `docs/PAPER_TRADING.md`）。**P5（盤中即時交易/券商連線）
-   未開始**：依停止條件不自動進入；且只有在訊號真的有樣本外優勢時才值得做。
+   （見 W26 與 `docs/PAPER_TRADING.md`）。
+6.5 **P5 本地自動化 ✅ 已完成（2026-10-21）**：七階段協調器、行情品質閘門
+   fail-closed、崩潰續跑/雙啟動拒絕/重試逾時、帳務稽核與健康狀態、
+   Windows 排程與操作文件（見 W27、`docs/LOCAL_AUTOMATION.md`、
+   `docs/RISK_GATES.md`）。**依停止條件停在 paper trading 階段**：
+   P6（券商 API 整合）不自動開始；且**只有在訊號真的有樣本外優勢時才值得做**。
+   仍待驗證：真實盤中行情來源實際連線（需使用者決定授權/帳戶，見 0.5(a)）、
+   交易時段長跑觀察。
 7. **B1 決策**：是否安裝 `lightgbm`/`scikit-learn`（需使用者決定）。
 8. **B23 累積已就緒、只差時間**：P2.8 已完成按日冪等累積、point-in-time 可用性、
    可稽核時間切點與最低觀察期間（120／建議 250 交易日）。
@@ -716,12 +776,12 @@ python -m pytest -q
 
 ---
 
-## 本輪 commit（P4 模擬交易引擎，2026-10-19，已 push 至 `origin/main`）
+## 本輪 commit（P5 本地自動化執行與故障恢復，2026-10-21，已 push 至 `origin/main`）
 
 | 順序 | 訊息 | 內容 |
 |---|---|---|
-| 1 | `feat(paper): P4 模擬交易引擎（帳務閉環/T+1 成交/風控/CLI/API）` | twstock/paper.py（新）、store.py（paper_* 表）、cli.py、app.py、risk.py（limits 參數）、tests/test_paper.py（23 項，全套 489 passed） |
-| 2 | （本文件所在 commit） | docs/PAPER_TRADING.md、plan.md、STATUS_REPORT 附錄 W、README |
+| 1 | `feat(orchestrator): P5 本地自動化協調器、行情品質閘門與故障恢復` | twstock/orchestrator.py（新）、twstock/gate.py（新）、store.py（run_round/run_stage/run_alert）、paper.py（閘門接線）、worker.py（--p5）、cli.py（p5）、app.py（/api/p5/*）、tests/test_p5_orchestrator.py（26 項，全套 515 passed） |
+| 2 | （本文件所在 commit） | docs/LOCAL_AUTOMATION.md、docs/RISK_GATES.md、plan.md、STATUS_REPORT、README、.env.example |
 
 ### 本階段的關鍵事實（實測，非推論）
 

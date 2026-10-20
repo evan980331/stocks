@@ -151,8 +151,35 @@ python -m twstock.cli paper kill / resume       :: 緊急停止／解除
 
 > ⚠️ 模擬成交是對真實交易的近似（開盤價±滑價，不模擬排隊與逐檔），
 > **不代表策略具備樣本外優勢**，也**不具備真實自動交易能力**。
-> 盤中即時交易屬 P5，本階段未實作。詳見
-> [`docs/PAPER_TRADING.md`](docs/PAPER_TRADING.md)。
+> 詳見 [`docs/PAPER_TRADING.md`](docs/PAPER_TRADING.md)。
+
+### 本地自動化執行（P5；純模擬、fail-closed）
+
+```bat
+python -m twstock.cli p5 run        :: 手動執行單輪（行情更新→品質→訊號→模擬交易→帳務核對→健康）
+python -m twstock.cli p5 run --due  :: 依排程執行（週末/未到點/當日已完成 → 跳過）
+python -m twstock.cli p5 status     :: 最近輪次、各階段結果與目前閘門
+python -m twstock.cli p5 errors     :: 最近失敗/被阻擋階段與異常事件
+python -m twstock.cli p5 audit      :: 帳務稽核（唯讀；不一致 → 退出碼 1，不修帳）
+python -m twstock.cli p5 gate       :: 行情品質閘門是否允許新模擬交易（不允許 → 1）
+python -m twstock.cli p5 alerts     :: 異常事件與實際送達狀態
+python -m twstock.cli start worker --interval 1800   :: 常駐（--p5 可改跑 P5 輪次）
+```
+
+自動化協調器 `twstock/orchestrator.py`：七階段依序執行，每輪唯一 `run_id`
+（可追查資料→訊號→訂單→成交），每階段記錄起訖時間、耗時、狀態、筆數、
+錯誤與重試次數（`run_round`/`run_stage` 表）；狀態沿用既有六態＋輪次層
+`success`/`partial_success`/`failed`/`skipped`——**單一來源失敗不會被誤報成
+整輪成功**。行情品質閘門 `twstock/gate.py` 為 **fail-closed**：無行情、
+行情過期、時間戳未知、盤中無可驗證即時行情、帳務不一致或 Kill Switch
+一律停止新模擬交易並記錄原因（**停止交易不等於清倉**）。
+崩潰後自動續跑已完成階段不重複下單；單一實例鎖、有限重試＋退避、
+單輪逾時不卡死系統。詳見 [`docs/LOCAL_AUTOMATION.md`](docs/LOCAL_AUTOMATION.md)
+與 [`docs/RISK_GATES.md`](docs/RISK_GATES.md)。
+
+> ⚠️ 本階段是**工程可靠性**，不是策略獲利最佳化；全程模擬交易、不連券商。
+> 真實行情來源**尚未實際連線驗證**（FinMind 分鐘資料歸類為延遲、MIS 受條款
+> 限制未啟用）。監控 API `/api/p5/*` 全部唯讀（GET），無任何下單端點。
 
 ### 服務生命週期
 
@@ -177,6 +204,9 @@ twstock/
   utils.py             # 共用工具（retry）
   risk.py              # 風險限額、執行模式、Kill Switch（正式交易預設關閉）
   costs.py             # 交易成本模型與 6 組情境（含流動性上限）
+  paper.py             # P4 模擬交易引擎（微元帳本、T+1 成交、reconcile）
+  gate.py              # P5 行情品質閘門（fail-closed：新單/既有單成交兩層判定）
+  orchestrator.py      # P5 自動化協調器（七階段輪次、冪等續跑、稽核、健康）
   strategies.py        # 策略規格：持有期間、進出場門檻、再平衡頻率
   validation.py        # 樣本外驗證：切分、purge/embargo、基準檢查、比較報告
   diagnostics.py       # 訊號資訊量診斷：IC／分組／隨機基準／多重檢定
@@ -198,7 +228,7 @@ twstock/
   ml_model.py          # LightGBM walk-forward（可選，未安裝時明確停用）
   backtest.py          # T+1 開盤成交、成本模型、週轉率指標、0050 基準
   pipeline.py          # 每日流程 + 結構化擷取狀態（ingest_run，另保留 ingest_log）
-  worker.py            # 監控 Worker（單一實例鎖、重試、逾時、健康狀態機）
+  worker.py            # 監控 Worker（單一實例鎖、重試、逾時、健康狀態機；--p5 輪次）
   ops.py               # start / stop / status / health（含擷取狀態）
   app.py               # FastAPI 本地儀表板
   cli.py               # CLI 唯一進入點
@@ -275,7 +305,10 @@ ML 標籤、訊號融合尺度、回測時間正確性、風險限制與 Kill Sw
 Worker 不得把失敗記成完整成功），以及行情介面（去重、舊不得覆蓋新、
 時間戳分離、健康狀態、訊號閘門、Worker 行情輪詢不影響 EOD）、
 模擬交易 17 類（帳務閉環、T+1 成交、防重播、風控、重啟恢復、無真實
-下單路徑）。目前 **489 項**。
+下單路徑），以及 P5 自動化 14 類（正常一輪、無行情停交易、過期/時間未知
+停交易、部分失敗標記、重複執行無重複訂單、雙協調器拒絕、子程序崩潰續跑、
+交易失敗回滾、kill switch、帳務不一致只回報不修帳、逾時與重試上限、
+時段邊界、活著但過期的健康狀態、正式 DB 隔離）。目前 **515 項**。
 
 測試一律將儲存層隔離到暫存 DB（`tests/conftest.py` 的 autouse 夾具），
 **不會**寫入或遷移 `twstock/data_store/` 的真實資料。
@@ -292,3 +325,7 @@ Worker 不得把失敗記成完整成功），以及行情介面（去重、舊�
   停止階梯與失敗情境測試（尚未全面遷移）。
 - [`docs/PAPER_TRADING.md`](docs/PAPER_TRADING.md)：P4 模擬交易引擎設計、
   帳務閉環、成交模擬假設、風險控制與**未實作限制**。
+- [`docs/LOCAL_AUTOMATION.md`](docs/LOCAL_AUTOMATION.md)：P5 本機自動化操作、
+  Windows 排程、設定檔、環境影響（休眠/斷網/配額/非交易日）與故障恢復。
+- [`docs/RISK_GATES.md`](docs/RISK_GATES.md)：P5 行情品質閘門阻擋條件、
+  fail-closed 語意、兩層閘門與故障排除。
