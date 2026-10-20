@@ -462,7 +462,8 @@ def run_forever(name: str = "worker", interval: int = 1800,
                 force_once: bool = False, *, attempts: int = 3,
                 task_timeout: int = DEFAULT_TASK_TIMEOUT,
                 max_failures: int = DEFAULT_MAX_FAILURES,
-                use_lock: bool = True) -> int:
+                use_lock: bool = True,
+                use_orchestrator: bool = False) -> int:
     """主迴圈。回傳程序結束碼（0 正常、2 重複啟動、3 任務失敗）。"""
     lock = WorkerLock(name)
     if use_lock and not lock.acquire():
@@ -483,7 +484,8 @@ def run_forever(name: str = "worker", interval: int = 1800,
                         task_started_at=None)
 
         if force_once:
-            outcome = _run_cycle_task(attempts=attempts)
+            outcome = (_run_p5_task(attempts=attempts, force=True)
+                       if use_orchestrator else _run_cycle_task(attempts=attempts))
             write_heartbeat(
                 status="running" if outcome.ok else "error",
                 last_cycle_ok=outcome.ok,
@@ -499,7 +501,8 @@ def run_forever(name: str = "worker", interval: int = 1800,
 
         failures = 0
         while not stop_requested(name):
-            outcome = _run_cycle_task(attempts=attempts)
+            outcome = (_run_p5_task(attempts=attempts)
+                       if use_orchestrator else _run_cycle_task(attempts=attempts))
             failures = 0 if outcome.ok else failures + 1
             write_heartbeat(
                 status="running" if outcome.ok else "error",
@@ -549,6 +552,28 @@ def _run_cycle_task(attempts: int = 3) -> TaskOutcome:
     return outcome
 
 
+def _run_p5_task(attempts: int = 3, force: bool = False) -> TaskOutcome:
+    """P5 協調器輪次：行情更新 → 品質 → 訊號 → 模擬交易 → 帳務核對 → 健康。
+
+    - 輪次為**部分成功**時不計為任務失敗（`last_cycle_status` 會顯示
+      `partial_success`，不誤報完整成功）；只有輪次 `failed` 才計為失敗。
+    - 內部另有單一實例鎖、冪等續跑與輪次逾時（見 orchestrator）。
+    """
+    from . import orchestrator
+    write_heartbeat(status="task_running",
+                    task_started_at=dt.datetime.now().isoformat(timespec="seconds"))
+    try:
+        def _call() -> str:
+            res = orchestrator.run_round(trigger="worker", force=force)
+            if res.status == orchestrator.ROUND_FAILED:
+                raise RuntimeError(res.error or f"P5 輪次失敗（{res.run_id}）")
+            return res.status
+        outcome = run_task_with_retry(_call, name="p5_round", attempts=attempts)
+    finally:
+        write_heartbeat(task_started_at=None, status="running")
+    return outcome
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -557,11 +582,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--once", action="store_true", help="立即執行一次後結束")
     ap.add_argument("--force", action="store_true", help="忽略時間窗，強制執行一次")
     ap.add_argument("--attempts", type=int, default=3, help="單輪任務重試次數上限")
+    ap.add_argument("--p5", action="store_true",
+                    help="以 P5 協調器輪次取代單純 ingest+打分（含模擬交易與帳務核對）")
     args = ap.parse_args(argv)
     if args.once or args.force:
         return run_forever(interval=args.interval, force_once=True,
-                           attempts=args.attempts)
-    return run_forever(interval=args.interval, attempts=args.attempts)
+                           attempts=args.attempts,
+                           use_orchestrator=args.p5)
+    return run_forever(interval=args.interval, attempts=args.attempts,
+                       use_orchestrator=args.p5)
 
 
 if __name__ == "__main__":

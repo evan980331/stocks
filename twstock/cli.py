@@ -7,6 +7,8 @@
   quotes（行情來源介面與健康狀態；子指令 status|poll|selftest|catalog）
   paper（P4 模擬交易；子指令 init|account|orders|fills|positions|ledger|
          cycle|risk|reconcile|recover|kill|resume —— 純模擬，不下真單）
+  p5（P5 自動化協調器；子指令 run|status|errors|audit|gate|alerts
+      —— 行情更新→品質→訊號→模擬交易→帳務核對→健康；純模擬）
 
 本地服務生命週期：
   dashboard（前景） | worker（前景）
@@ -33,7 +35,7 @@ logging.basicConfig(level=logging.INFO,
 
 DATA_CMDS = ["ingest", "run", "backtest", "validate", "notify", "dashboard",
              "train", "all", "experts", "ai", "advice", "datacheck",
-             "research", "stress", "quotes", "paper"]
+             "research", "stress", "quotes", "paper", "p5"]
 OPS_CMDS = ["start", "stop", "restart", "status", "health", "worker"]
 
 
@@ -60,6 +62,8 @@ def main() -> int:
                     help="paper orders 的狀態過濾（如 accepted/filled）")
     ap.add_argument("--reason", default=None,
                     help="paper kill 的緊急停止原因")
+    ap.add_argument("--due", action="store_true",
+                    help="p5 run：依排程判定執行（同日已有成功輪則跳過）")
     args = ap.parse_args()
 
     # argparse 的 nargs="*" 會把後續的 --at 一併吃進 --stocks，
@@ -132,6 +136,17 @@ def main() -> int:
         if args.reason:
             sub += ["--reason", args.reason]
         return paper_mod.main(sub)
+
+    if args.cmd == "p5":
+        # P5：本地自動化協調器（**純模擬交易**；子指令
+        # run|--due|status|errors|audit|gate|alerts）。
+        from . import orchestrator as p5_mod
+        sub = [args.name or "status"]
+        if args.limit is not None:
+            sub += ["--limit", str(args.limit)]
+        if args.due:
+            sub += ["--due"]
+        return p5_mod.main(sub)
 
     # ---- 資料與分析 ----
     if args.cmd in ("ingest", "all"):

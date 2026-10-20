@@ -62,6 +62,7 @@ from typing import Any, Iterator
 
 import pandas as pd
 
+from . import gate as gate_mod
 from . import risk as risk_mod
 from .config import CONFIG, is_readonly
 from .costs import CostModel, get_cost_model
@@ -659,6 +660,16 @@ class PaperEngine:
                             f"資金不足（含費用約需 {f_twd(need)}，"
                             f"可用 {f_twd(cash)}）")
 
+            # --- P5-B 行情品質閘門（最後一道；fail-closed）---
+            # 涵蓋：行情過期/無資料、盤中無即時行情、非交易日、帳務不一致、
+            # Kill Switch。任一不過即拒單（拒單也入庫可稽核）。
+            dec = gate_mod.evaluate(now=now, engine=self,
+                                    limits=self.limits,
+                                    killswitch=self.killswitch)
+            for r in dec.reasons:
+                if r not in reasons:
+                    reasons.append(r)
+
             if reasons:
                 return self._reject_in_tx(conn, aid, stock_id, side, qty,
                                           reasons, client_order_id, reason)
@@ -771,6 +782,16 @@ class PaperEngine:
                             f"Kill Switch：{self.killswitch.reason()}")
                 return {"order_id": oid, "status": cur, "filled": 0,
                         "reason": "kill_switch_engaged"}
+            # P5-B：帳務不一致等「停止交易」條件也擋成交（只回報不修帳）。
+            # 行情過期/非交易時段**不**擋既定訂單成交（P4 既有語意）。
+            halted = [r for r in gate_mod.fill_block_reasons(
+                engine=self, killswitch=self.killswitch)
+                if not r.startswith("Kill Switch")]
+            if halted:
+                self._event(conn, aid, "no_fill", oid,
+                            f"交易暫停：{halted[0]}")
+                return {"order_id": oid, "status": cur, "filled": 0,
+                        "reason": "trading_halted", "detail": halted[0]}
             after = max(sig_day, last_checked)
             bar = self._bar_after(stock, after)
             if bar is None or _today(bar["date"]) > _today(now) or (
@@ -1180,16 +1201,23 @@ class PaperEngine:
     # ------------------------------------------------------------------
     # 週期流程（EOD 訊號 → 決策 → 訂單 → 成交 → 快照）
     # ------------------------------------------------------------------
-    def run_paper_cycle(self, *, now: dt.datetime | None = None
-                        ) -> dict[str, Any]:
+    def run_paper_cycle(self, *, now: dt.datetime | None = None,
+                        run_id: str = "") -> dict[str, Any]:
         """執行一次模擬交易週期。
 
+        0. **P5-B 行情品質閘門先行**（``gate.evaluate``）：行情過期/無資料、
+           盤中無可驗證即時行情、非交易日、帳務不一致、Kill Switch 任一成立
+           → **不建立任何新訂單**（決策仍保留供稽核），並把判定寫進
+           ``results["gate"]``；既有未完成訂單是否續成交依 ``allow_fills``。
         1. 讀最新 signals（T 日）→ 規則（沿用 strategies 慣例）：
            ``score >= buy_threshold`` 買入（top_n、未持有、無未完成買單）；
            持倉滿 ``hold_days`` 賣出全部（不對稱門檻的策略邏輯屬 P5；
            本期為 fixed-hold + threshold，與回測 default 相同）。
         2. 成交模擬（``process_pending``）；未完成訂單過期者取消。
-        3. 快照更新。
+        3. 快照更新（``run_id`` 寫入快照備註，供追查）。
+
+        ``run_id`` 只進 ``reason``/備註；**不得**進 ``client_order_id``
+        （那會破壞跨輪冪等，重跑就會重複下單）。
         """
         now = now or dt.datetime.now()
         aid_acc = self.account()
@@ -1203,6 +1231,14 @@ class PaperEngine:
         results: dict[str, Any] = {"orders": [], "fills": [],
                                    "decisions": decisions,
                                    "skipped": []}
+        # --- 閘門（新單）：不通過則整輪不下新單，但仍成交既有訂單與快照 ---
+        gdec = gate_mod.evaluate(now=now, engine=self, limits=self.limits,
+                                 killswitch=self.killswitch)
+        results["gate"] = gdec.as_dict()
+        if not gdec.allow_new_orders:
+            results["blocked"] = list(gdec.reasons)
+            log.warning("paper cycle 新單被閘門阻止（%s）：%s", gdec.kind,
+                        "；".join(gdec.reasons))
         cash, positions = self.cash_and_positions(aid)
         with self._ro() as conn:
             equity = self._equity_with_market(conn, aid, cash, positions)
@@ -1272,6 +1308,12 @@ class PaperEngine:
             if dec["action"] == "SKIP":
                 results["skipped"].append(dec)
                 continue
+            if not gdec.allow_new_orders:
+                # 閘門關閉：決策保留供稽核，但一張新單都不建立
+                results["skipped"].append({**dec,
+                                           "reason": "gate_blocked",
+                                           "gate_kind": gdec.kind})
+                continue
             res = self.place_order(
                 stock_id=dec["stock_id"], side=dec["action"],
                 qty=int(dec["qty"]), client_order_id=(
@@ -1279,12 +1321,14 @@ class PaperEngine:
                     f"{dec['stock_id']}"),
                 signal_date=dec["ref_date"],
                 price_hint=dec.get("price_hint"),
-                reason="paper_cycle", now=now)
+                reason=(f"paper_cycle:{run_id}" if run_id
+                        else "paper_cycle"), now=now)
             results["orders"].append(res)
         fill_res = self.process_pending(now=now)
         results["fills"] = fill_res
-        results["snapshot"] = self.snapshot(now=now,
-                                            note="paper_cycle")
+        results["snapshot"] = self.snapshot(
+            now=now, note=(f"paper_cycle:{run_id}" if run_id
+                           else "paper_cycle"))
         return results
 
     def _aid_public(self) -> int:
@@ -1512,7 +1556,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "cycle":
         res = eng.run_paper_cycle()
         snap = res["snapshot"]
+        ginfo = res.get("gate") or {}
         print(f"=== paper cycle 完成（{len(res['orders'])} 張訂單指令） ===")
+        if ginfo and not ginfo.get("allow_new_orders", True):
+            print("  閘門：禁止新增模擬交易（fail-closed）")
+            for gr in ginfo.get("reasons", []):
+                print(f"    ⛔ {gr}")
         for o in res["orders"]:
             tag = "✔ 已建立" if o.get("accepted") else (
                 "↺ 冪等既存在" if o.get("duplicate") else "✘ 拒單")

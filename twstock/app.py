@@ -428,3 +428,58 @@ def api_paper_reconcile() -> dict:
         return eng.reconcile()
     except (PaperError, RuntimeError) as e:
         return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# P5：自動化協調器唯讀監控 API（全部 GET；**無任何下單/成交端點**）。
+# 回傳明確狀態、錯誤原因與最後更新時間；不一致時只回報、不修改資料。
+# ---------------------------------------------------------------------------
+
+def _safe(fn, *a, **kw) -> dict:
+    """呼叫監控函式；失敗時回明確 error（不 500、不静默）。"""
+    try:
+        return jsonable_encoder(fn(*a, **kw))
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e), "time": dt.datetime.now().isoformat(
+            timespec="seconds")}
+
+
+@app.get("/api/p5/health")
+def api_p5_health() -> dict:
+    """系統健康狀態（程序存活＋資料新鮮度＋錯誤率＋帳務＋閘門）。"""
+    from .orchestrator import health_report, recent_rounds
+    return {"health": _safe(health_report), "runs": _safe(recent_rounds, 3)}
+
+
+@app.get("/api/p5/audit")
+def api_p5_audit() -> dict:
+    """帳務稽核（唯讀）；發現不一致只回報，不修帳。"""
+    from .orchestrator import audit_report
+    return _safe(audit_report)
+
+
+@app.get("/api/p5/gate")
+def api_p5_gate() -> dict:
+    """行情品質閘門目前是否允許新增模擬交易（含原因）。"""
+    from .gate import evaluate
+    from .paper import PaperEngine
+    eng = PaperEngine()
+    try:
+        engine = eng if eng.account() is not None else None
+    except Exception:  # noqa: BLE001
+        engine = None
+    return _safe(lambda: evaluate(engine=engine).as_dict())
+
+
+@app.get("/api/p5/runs")
+def api_p5_runs(limit: int = 5) -> dict:
+    """最近的自動化輪次與各階段結果（成功/部分成功/失敗/跳過）。"""
+    from .orchestrator import recent_rounds
+    return {"items": _safe(recent_rounds, limit)}
+
+
+@app.get("/api/p5/alerts")
+def api_p5_alerts(limit: int = 50) -> dict:
+    """異常事件紀錄（含實際送達狀態；未設定通道時為 not_configured）。"""
+    from .orchestrator import recent_alerts
+    return {"items": _safe(recent_alerts, limit)}

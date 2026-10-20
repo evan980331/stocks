@@ -214,6 +214,35 @@ CREATE TABLE IF NOT EXISTS paper_event (
 -- 供 paper_snapshot（冪等快照：同一 as_of 重跑不重複）用
 CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_snapshot_asof
     ON paper_snapshot(account_id, as_of);
+
+-- P5：本地自動化輪次與階段紀錄（每輪唯一識別碼 run_id，可追查資料→訊號→
+-- 訂單→成交）。status 沿用既有命名：階段用 IngestStatus 六態，輪次用
+-- success / partial_success / failed / skipped。冪等：run_id 為主鍵、
+-- (run_id, stage) 為主鍵 → 同一輪重跑/續跑不重複寫列。
+CREATE TABLE IF NOT EXISTS run_round (
+    run_id TEXT PRIMARY KEY,     -- 每輪唯一識別碼（p5-…）
+    trigger TEXT,                -- manual / scheduled / worker / resume
+    started_at TEXT, ended_at TEXT,
+    status TEXT,                 -- running / success / partial_success / failed / skipped
+    error TEXT, notes TEXT       -- 錯誤摘要（redact 後）與備註（含續跑來源）
+);
+CREATE TABLE IF NOT EXISTS run_stage (
+    run_id TEXT, stage TEXT,     -- ingest/quotes/quality/signals/paper/reconcile/health
+    started_at TEXT, ended_at TEXT, duration_s REAL,
+    status TEXT,                 -- IngestStatus 六態 + running（執行中，崩潰後可辨識）
+    rows INTEGER,                -- 該階段處理的資料筆數
+    error TEXT,                  -- 錯誤摘要（redact 後）
+    attempts INTEGER,            -- 實際執行次數（含重試）
+    kind TEXT,                   -- policy / blocked：跳過原因分類（決定整輪狀態）
+    detail TEXT,                 -- JSON 詳情（run_id 關聯、閘門理由等）
+    PRIMARY KEY (run_id, stage)
+);
+CREATE TABLE IF NOT EXISTS run_alert (
+    alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT, level TEXT,         -- info / warning / error
+    run_id TEXT, stage TEXT, kind TEXT, message TEXT,
+    delivered TEXT               -- recorded / telegram_sent / telegram_failed / not_configured
+);
 """
 
 # 各表用於去重的主鍵（與 SCHEMA 一致）
@@ -239,6 +268,10 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "paper_ledger": ("ledger_id",),
     "paper_snapshot": ("snapshot_id",),
     "paper_event": ("event_id",),
+    # P5 自動化輪次/階段/事件（run_id 冪等；alert 自動編號）
+    "run_round": ("run_id",),
+    "run_stage": ("run_id", "stage"),
+    "run_alert": (),
 }
 
 # 舊資料無法追溯的標記值（與 twstock.data.status 一致；此處不 import 以避免循環）
